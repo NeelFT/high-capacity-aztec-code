@@ -4,6 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HCAC-OFT</title>
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <link rel="manifest" href="%BASE_URL%manifest.webmanifest">
+  <link rel="icon" href="%BASE_URL%icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="%BASE_URL%icons/icon-180.png">
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { margin: 0; min-height: 100vh; background: #000; color: #fff; }
@@ -40,6 +46,7 @@
 <body>
   <main>
     <h1>HCAC-OFT</h1>
+    <p class="subtle">Install from your browser menu: choose <strong>Install app</strong> or <strong>Add to Home Screen</strong>.</p>
     <nav class="tabs" aria-label="Transfer mode">
       <button id="sendTab" class="active" type="button" aria-selected="true">Send</button>
       <button id="receiveTab" type="button" aria-selected="false">Receive</button>

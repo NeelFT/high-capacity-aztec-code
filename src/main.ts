@@ -6,6 +6,13 @@ import type { PreparedAztecTransfer } from './aztec';
 import type { DecoderTrace } from './image-decoder';
 import type { WorkerRequest, WorkerResponse } from './worker-protocol';
 
+if ('serviceWorker' in navigator && import.meta.env.PROD) {
+  window.addEventListener('load', () => {
+    void navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`)
+      .catch((error: unknown) => console.error('Unable to register the offline app worker.', error));
+  });
+}
+
 const MATRIX_SIZE = 32;
 const SCAN_MAX_SIDE = 360;
 const SCAN_FRAME_QUEUE_LIMIT = 4;
