@@ -27,6 +27,7 @@ const sendStatus = document.getElementById('sendStatus') as HTMLElement;
 const sendFileDetails = document.getElementById('sendFileDetails') as HTMLElement;
 const canvas = document.getElementById('tx') as HTMLCanvasElement;
 const camera = document.getElementById('camera') as HTMLVideoElement;
+const cameraViewport = document.getElementById('cameraViewport') as HTMLElement;
 const cameraCanvas = document.getElementById('scanCanvas') as HTMLCanvasElement;
 const startButton = document.getElementById('startButton') as HTMLButtonElement;
 const receiveStatus = document.getElementById('receiveStatus') as HTMLElement;
@@ -57,13 +58,9 @@ let videoFrameCallback = 0;
 let frameInFlight = false;
 const queuedScanFrames: ImageData[] = [];
 let lastScanCaptureTime = 0;
-let activeZoomTrack: MediaStreamTrack | null = null;
 let receiverGeneration = 0;
 let senderGeneration = 0;
 let verifiedReceivedFile: { bytes: Uint8Array; name: string; mime: string } | null = null;
-
-type ZoomCapabilities = MediaTrackCapabilities & { zoom?: { min: number; max: number; step?: number } };
-type ZoomConstraints = MediaTrackConstraints & { advanced?: Array<MediaTrackConstraintSet & { zoom?: number }> };
 
 function formatFileSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -102,33 +99,10 @@ function setMode(mode: 'send' | 'receive'): void {
   }
 }
 
-function setCameraZoomAvailability(): void {
-  const track = stream?.getVideoTracks()[0] ?? null;
-  activeZoomTrack = track;
-  const zoom = (track?.getCapabilities() as ZoomCapabilities | undefined)?.zoom;
-  if (!zoom) {
-    zoomSlider.disabled = true;
-    zoomHelp.textContent = 'Move closer to the screen if the image is hard to read.';
-    return;
-  }
-  zoomSlider.min = String(zoom.min);
-  zoomSlider.max = String(zoom.max);
-  zoomSlider.step = String(zoom.step ?? 0.1);
-  zoomSlider.value = String(zoom.min);
-  zoomSlider.disabled = false;
-  zoomHelp.textContent = 'Use the zoom control if needed.';
-}
-
-async function applyCameraZoom(): Promise<void> {
-  if (!activeZoomTrack) return;
-  try {
-    const constraints: ZoomConstraints = { advanced: [{ zoom: Number(zoomSlider.value) }] };
-    await activeZoomTrack.applyConstraints(constraints);
-  } catch (error) {
-    console.error('Could not adjust the camera zoom.', error);
-    zoomSlider.disabled = true;
-    zoomHelp.textContent = 'Move closer to the screen if the image is hard to read.';
-  }
+function updateCameraZoom(): void {
+  const zoom = Math.max(1, Number(zoomSlider.value) || 1);
+  cameraViewport.style.transform = `scale(${zoom})`;
+  zoomHelp.textContent = `Digital zoom: ${zoom.toFixed(1)}×. Higher zoom may soften the image.`;
 }
 
 function updateScanStatus(trace: Omit<DecoderTrace, 'packet'>): void {
@@ -169,9 +143,10 @@ function updateCameraOverlay(trace: Omit<DecoderTrace, 'packet'>): void {
   }
   cameraOverlay.setAttribute('viewBox', `0 0 ${width} ${height}`);
   const sourceSize = Math.min(width, height);
-  const cropX = Math.floor((width - sourceSize) / 2);
-  const cropY = Math.floor((height - sourceSize) / 2);
-  const scale = sourceSize / trace.imageWidth;
+  const cropSize = sourceSize / Math.max(1, Number(zoomSlider.value) || 1);
+  const cropX = (width - cropSize) / 2;
+  const cropY = (height - cropSize) / 2;
+  const scale = cropSize / trace.imageWidth;
   if (trace.corners) {
     const points = trace.corners
       .map((point) => `${point.x * scale + cropX},${point.y * scale + cropY}`)
@@ -258,10 +233,11 @@ function scan(timestamp?: number): void {
     stopReceiver();
     return;
   }
-  const cropX = Math.floor((camera.videoWidth - sourceSize) / 2);
-  const cropY = Math.floor((camera.videoHeight - sourceSize) / 2);
+  const cropSize = sourceSize / Math.max(1, Number(zoomSlider.value) || 1);
+  const cropX = (camera.videoWidth - cropSize) / 2;
+  const cropY = (camera.videoHeight - cropSize) / 2;
   try {
-    context.drawImage(camera, cropX, cropY, sourceSize, sourceSize, 0, 0, scanSize, scanSize);
+    context.drawImage(camera, cropX, cropY, cropSize, cropSize, 0, 0, scanSize, scanSize);
     const image = context.getImageData(0, 0, scanSize, scanSize);
     if (queuedScanFrames.length === SCAN_FRAME_QUEUE_LIMIT) queuedScanFrames.shift();
     queuedScanFrames.push(image);
@@ -288,7 +264,8 @@ function stopReceiver(): void {
   stream?.getTracks().forEach((track) => track.stop());
   stream = null;
   camera.srcObject = null;
-  activeZoomTrack = null;
+  zoomSlider.value = '1';
+  cameraViewport.style.transform = 'scale(1)';
   zoomSlider.disabled = true;
   frameInFlight = false;
   cameraOutline.setAttribute('visibility', 'hidden');
@@ -527,7 +504,9 @@ startButton.onclick = async () => {
         setReceiveStatus('Camera stopped.');
       }, { once: true });
     }
-    setCameraZoomAvailability();
+    zoomSlider.value = '1';
+    zoomSlider.disabled = false;
+    updateCameraZoom();
     setReceiveStatus('Looking for the colorful code. Point the camera at the sender’s screen.', 'searching');
     startButton.textContent = 'Stop camera';
     worker.postMessage({ type: 'start', targetMatrixSize: MATRIX_SIZE } satisfies WorkerRequest);
@@ -555,7 +534,7 @@ startButton.onclick = async () => {
   }
 };
 
-zoomSlider.oninput = () => { void applyCameraZoom(); };
+zoomSlider.oninput = updateCameraZoom;
 exportFileButton.onclick = () => {
   if (verifiedReceivedFile) void exportVerifiedFile(verifiedReceivedFile);
 };
