@@ -22,6 +22,8 @@ Open the **Network** HTTPS address printed by Vite on each device (for example, 
 
 Open the hosted app at https://neelft.github.io/high-capacity-aztec-code/ using your phone's browser. On Android, use the browser menu and select **Install app** (or **Add to Home screen**). On iPhone, open the Share menu in Safari and select **Add to Home Screen**. The app shell and static assets are cached for offline launch after the first visit; camera access and file sharing still depend on browser and device support.
 
+The Android APK loads the web app from the same hosted address, so changes published from the `copilot/qr-web-only` branch appear when the app is opened again without reinstalling the APK. The app needs an internet connection to load the latest version.
+
 ## Send a file
 
 1. On the sending device, open the app and choose a file.
