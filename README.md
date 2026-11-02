@@ -22,6 +22,10 @@ Open the **Network** HTTPS address printed by Vite on each device (for example, 
 
 Open the hosted app at https://neelft.github.io/high-capacity-aztec-code/ using your phone's browser. On Android, use the browser menu and select **Install app** (or **Add to Home screen**). On iPhone, open the Share menu in Safari and select **Add to Home Screen**. The app shell and static assets are cached for offline launch after the first visit; camera access and file sharing still depend on browser and device support.
 
+### Download the offline Android app
+
+[Download the HCAC-OFT APK](https://github.com/NeelFT/high-capacity-aztec-code/raw/refs/heads/copilot/qr-web-only/downloads/HCAC-OFT-v1.0-debug.apk?download=1). This debug-signed APK includes the app locally and works offline; it needs camera permission to scan transfers and does not require internet access. Android may ask you to allow installation from your browser.
+
 ## Send a file
 
 1. On the sending device, open the app and choose a file.
@@ -30,9 +34,9 @@ Open the hosted app at https://neelft.github.io/high-capacity-aztec-code/ using 
 4. On the receiving device, open the same app, choose **Receive**, and press **Start camera**.
 5. Point the camera at the sender's screen and keep the full frame in view. When enough packets have been decoded, the reconstructed file downloads automatically.
 
-The sender includes the original blocks plus repair packets, then repeats the sequence. That gives the receiver another chance to collect missing data if a frame is blurred or missed. A steady, bright screen, a focused camera, and low glare help. Keep the whole frame visible and large in the camera preview; use the camera zoom control if the browser/device offers it. Camera permission requires HTTPS (or localhost), and some mobile browsers restrict camera access when the page is opened from an insecure LAN address.
+The sender includes the original blocks plus repair packets, then repeats the sequence. That gives the receiver another chance to collect missing data if a frame is blurred or missed. A steady, bright screen, a focused camera, and low glare help. Keep the whole frame visible and use the camera zoom slider to magnify the preview and scan area; higher digital zoom may soften the image. Camera permission requires HTTPS (or localhost), and some mobile browsers restrict camera access when the page is opened from an insecure LAN address.
 
-The receiver samples each module at 25 points near its center and calibrates against the on-frame color palette. It can correct up to three ambiguous color symbols when packet CRC32 confirms the correction. Each valid packet is also stored locally in IndexedDB by transfer session and frame ID; collected packets can arrive in any order and are restored when scanning resumes. Saved packets are cleared after SHA-256 verification.
+The receiver samples each module at 25 points near its center and calibrates against the on-frame color palette. CRC32-guided recovery retries packets with ambiguous color readings. Each valid packet is also stored locally in IndexedDB by transfer session and frame ID; collected packets can arrive in any order and are restored when scanning resumes. Saved packets are cleared after SHA-256 verification.
 
 Before packetization, the sender gzip-compresses a file when the compressed result is smaller. Compact metadata stores the SHA-256 digest as 32 binary bytes instead of 64 hexadecimal characters, reducing first-packet overhead and freeing more of each fixed-size frame for file data. The receiver still accepts earlier metadata formats, decompresses within the declared size limit, and verifies the original file's SHA-256 before download. Incompressible files are sent unchanged. Use the current app on both devices for transfers using compact metadata. Visual padding modules are not file data: they balance the palette and stay in place to support reliable color recognition.
 
