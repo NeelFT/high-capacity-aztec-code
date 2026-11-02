@@ -6,7 +6,10 @@ import type { PreparedAztecTransfer } from './aztec';
 import type { DecoderTrace } from './image-decoder';
 import type { WorkerRequest, WorkerResponse } from './worker-protocol';
 
-if ('serviceWorker' in navigator && import.meta.env.PROD) {
+const installHint = document.getElementById('installHint');
+if (Capacitor.isNativePlatform() && installHint) installHint.hidden = true;
+
+if ('serviceWorker' in navigator && import.meta.env.PROD && !Capacitor.isNativePlatform()) {
   window.addEventListener('load', () => {
     void navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`)
       .catch((error: unknown) => console.error('Unable to register the offline app worker.', error));
