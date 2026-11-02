@@ -1,4 +1,4 @@
-import { COLORS, colorSymbolMask, createAztecLayout, decode3BitPacketDetailed, decode3BitPayload, HEADER_BYTES, readU32 } from './aztec.ts';
+import { COLORS, colorSymbolMask, crc32, createAztecLayout, decode3BitPacketDetailed, decode3BitPayload, HEADER_BYTES, readU32 } from './aztec.ts';
 import type { PacketDecodeResult } from './aztec.ts';
 import type { AztecLayout } from './aztec.ts';
 
@@ -549,17 +549,39 @@ function decodeWithSupportedMasks(symbols: Uint8Array): PacketDecodeResult {
   const fixedHeaderSymbols = Math.ceil(HEADER_BYTES * 8 / 3);
   const legacySymbols = symbols.map((symbol, index) => symbol ^ colorSymbolMask(index));
   const legacyDecoded = decode3BitPacketDetailed(legacySymbols);
-  if (legacyDecoded.status === 'decoded' || symbols.length < fixedHeaderSymbols) return legacyDecoded;
+  if (legacyDecoded.status === 'decoded' || symbols.length < fixedHeaderSymbols) {
+    return { ...legacyDecoded, maskSeed: 0 };
+  }
   const fixedHeader = decode3BitPayload(legacySymbols.subarray(0, fixedHeaderSymbols), HEADER_BYTES * 8);
   const maskSeed = readU32(new DataView(fixedHeader.buffer, fixedHeader.byteOffset, fixedHeader.byteLength), 8);
   const seededSymbols = symbols.map((symbol, index) =>
     symbol ^ colorSymbolMask(index, index < fixedHeaderSymbols ? 0 : maskSeed));
   const seededDecoded = decode3BitPacketDetailed(seededSymbols);
   const statusRank = { 'header-invalid': 0, 'crc-failed': 1, decoded: 2 } as const;
-  return statusRank[seededDecoded.status] > statusRank[legacyDecoded.status] ? seededDecoded : legacyDecoded;
+  return statusRank[seededDecoded.status] > statusRank[legacyDecoded.status]
+    ? { ...seededDecoded, maskSeed }
+    : { ...legacyDecoded, maskSeed: 0 };
 }
 
-function recoverColorErrors(symbols: Uint8Array, alternatives: Array<{ index: number; symbol: number; margin: number }>): PacketDecodeResult {
+function packetChecksumSyndrome(packet: Uint8Array): number {
+  const checksumOffset = packet.length - 4;
+  const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+  return readU32(view, checksumOffset) ^ crc32(packet.subarray(0, checksumOffset));
+}
+
+function applySymbolCorrection(symbols: Uint8Array, changes: Array<{ index: number; symbol: number }>): PacketDecodeResult {
+  const originals = changes.map(({ index }) => symbols[index]);
+  changes.forEach(({ index, symbol }) => { symbols[index] = symbol; });
+  const decoded = decodeWithSupportedMasks(symbols);
+  changes.forEach(({ index }, position) => { symbols[index] = originals[position]; });
+  return decoded;
+}
+
+function recoverColorErrors(
+  symbols: Uint8Array,
+  alternatives: Array<{ index: number; symbol: number; margin: number }>,
+  recoverHeader = true,
+): PacketDecodeResult {
   const initial = decodeWithSupportedMasks(symbols);
   if (initial.status === 'decoded') return initial;
   const rankedAlternatives = alternatives.sort((a, b) => a.margin - b.margin);
@@ -571,59 +593,135 @@ function recoverColorErrors(symbols: Uint8Array, alternatives: Array<{ index: nu
     likely.push(alternative);
     if (likely.length === 192) break;
   }
+
+  const packet = initial.candidatePacket;
+  if (packet && initial.maskSeed !== undefined) {
+    if (recoverHeader) {
+      const fixedHeaderSymbols = Math.ceil(HEADER_BYTES * 8 / 3);
+      for (const correction of rankedAlternatives.filter(({ index }) => index < fixedHeaderSymbols).slice(0, 96)) {
+        const decoded = applySymbolCorrection(symbols, [correction]);
+        if (decoded.status === 'decoded') return decoded;
+        if (decoded.candidatePacket && decoded.maskSeed !== initial.maskSeed) {
+          const originals = symbols[correction.index];
+          symbols[correction.index] = correction.symbol;
+          const recovered = recoverColorErrors(
+            symbols,
+            rankedAlternatives.filter(({ index }) => index !== correction.index),
+            false,
+          );
+          symbols[correction.index] = originals;
+          if (recovered.status === 'decoded') return recovered;
+        }
+      }
+    }
+    const packetSymbolCount = Math.ceil(packet.length * 8 / 3);
+    const candidateIndexes = new Set(likely.slice(0, 64).map(({ index }) => index));
+    const changes: Array<{ index: number; symbol: number; margin: number; effect: number }> = [];
+    const baseSyndrome = packetChecksumSyndrome(packet);
+    const changedPacket = packet.slice();
+    for (const alternative of rankedAlternatives) {
+      if (!candidateIndexes.has(alternative.index) || alternative.index >= packetSymbolCount) continue;
+      const delta = symbols[alternative.index] ^ alternative.symbol;
+      if (delta === 0) continue;
+      for (let bitOffset = 0; bitOffset < 3; bitOffset += 1) {
+        const bitIndex = alternative.index * 3 + bitOffset;
+        if (bitIndex >= packet.length * 8 || ((delta >> (2 - bitOffset)) & 1) === 0) continue;
+        const byteIndex = Math.floor(bitIndex / 8);
+        changedPacket[byteIndex] ^= 1 << (7 - (bitIndex % 8));
+      }
+      const effect = baseSyndrome ^ packetChecksumSyndrome(changedPacket);
+      for (let bitOffset = 0; bitOffset < 3; bitOffset += 1) {
+        const bitIndex = alternative.index * 3 + bitOffset;
+        if (bitIndex >= packet.length * 8 || ((delta >> (2 - bitOffset)) & 1) === 0) continue;
+        const byteIndex = Math.floor(bitIndex / 8);
+        changedPacket[byteIndex] ^= 1 << (7 - (bitIndex % 8));
+      }
+      changes.push({ ...alternative, effect });
+    }
+
+    const tryChanges = (corrections: Array<{ index: number; symbol: number }>): PacketDecodeResult | null => {
+      const decoded = applySymbolCorrection(symbols, corrections);
+      return decoded.status === 'decoded' ? decoded : null;
+    };
+    for (const change of changes) {
+      if (change.effect === baseSyndrome) {
+        const decoded = tryChanges([change]);
+        if (decoded) return decoded;
+      }
+    }
+
+    const pairsByEffect = new Map<number, Array<{ id: number; first: number; second: number }>>();
+    let pairId = 0;
+    for (let first = 0; first < changes.length; first += 1) {
+      for (let second = first + 1; second < changes.length; second += 1) {
+        if (changes[first].index === changes[second].index) continue;
+        const effect = changes[first].effect ^ changes[second].effect;
+        const pair = { id: pairId++, first, second };
+        const matchingPairs = pairsByEffect.get(effect);
+        if (matchingPairs) matchingPairs.push(pair);
+        else pairsByEffect.set(effect, [pair]);
+      }
+    }
+    for (let changeIndex = 0; changeIndex < changes.length; changeIndex += 1) {
+      const matchingPairs = pairsByEffect.get(baseSyndrome ^ changes[changeIndex].effect);
+      if (!matchingPairs) continue;
+      for (const pair of matchingPairs) {
+        if (changes[pair.first].index === changes[changeIndex].index ||
+          changes[pair.second].index === changes[changeIndex].index) continue;
+        const decoded = tryChanges([changes[pair.first], changes[pair.second], changes[changeIndex]]);
+        if (decoded) return decoded;
+      }
+    }
+    for (const [effect, pairs] of pairsByEffect) {
+      const matchingPairs = pairsByEffect.get(baseSyndrome ^ effect);
+      if (!matchingPairs) continue;
+      for (const firstPair of pairs) {
+        for (const secondPair of matchingPairs) {
+          if (firstPair.id >= secondPair.id) continue;
+          const firstChange = changes[firstPair.first];
+          const secondChange = changes[firstPair.second];
+          const thirdChange = changes[secondPair.first];
+          const fourthChange = changes[secondPair.second];
+          const indexes = new Set([firstChange.index, secondChange.index, thirdChange.index, fourthChange.index]);
+          if (indexes.size !== 4) continue;
+          const decoded = tryChanges([firstChange, secondChange, thirdChange, fourthChange]);
+          if (decoded) return decoded;
+        }
+      }
+    }
+    return initial;
+  }
+
   const singleCandidates = rankedAlternatives.slice(0, 256);
   for (const candidate of singleCandidates) {
-    const original = symbols[candidate.index];
-    symbols[candidate.index] = candidate.symbol;
-    const decoded = decodeWithSupportedMasks(symbols);
-    symbols[candidate.index] = original;
+    const decoded = applySymbolCorrection(symbols, [candidate]);
     if (decoded.status === 'decoded') return decoded;
   }
   const pairCandidates = likely.slice(0, 48);
   for (let first = 0; first < pairCandidates.length; first += 1) {
     const firstCandidate = pairCandidates[first];
-    const firstOriginal = symbols[firstCandidate.index];
-    symbols[firstCandidate.index] = firstCandidate.symbol;
     for (let second = first + 1; second < pairCandidates.length; second += 1) {
       const secondCandidate = pairCandidates[second];
       if (secondCandidate.index === firstCandidate.index) continue;
-      const secondOriginal = symbols[secondCandidate.index];
-      symbols[secondCandidate.index] = secondCandidate.symbol;
-      const decoded = decodeWithSupportedMasks(symbols);
-      symbols[secondCandidate.index] = secondOriginal;
+      const decoded = applySymbolCorrection(symbols, [firstCandidate, secondCandidate]);
       if (decoded.status === 'decoded') {
-        symbols[firstCandidate.index] = firstOriginal;
         return decoded;
       }
     }
-    symbols[firstCandidate.index] = firstOriginal;
   }
   const tripleCandidates = likely.slice(0, 18);
   for (let first = 0; first < tripleCandidates.length; first += 1) {
     const firstCandidate = tripleCandidates[first];
-    const firstOriginal = symbols[firstCandidate.index];
-    symbols[firstCandidate.index] = firstCandidate.symbol;
     for (let second = first + 1; second < tripleCandidates.length; second += 1) {
       const secondCandidate = tripleCandidates[second];
       if (secondCandidate.index === firstCandidate.index) continue;
-      const secondOriginal = symbols[secondCandidate.index];
-      symbols[secondCandidate.index] = secondCandidate.symbol;
       for (let third = second + 1; third < tripleCandidates.length; third += 1) {
         const thirdCandidate = tripleCandidates[third];
         if (thirdCandidate.index === firstCandidate.index || thirdCandidate.index === secondCandidate.index) continue;
-        const thirdOriginal = symbols[thirdCandidate.index];
-        symbols[thirdCandidate.index] = thirdCandidate.symbol;
-        const decoded = decodeWithSupportedMasks(symbols);
-        symbols[thirdCandidate.index] = thirdOriginal;
-        if (decoded.status === 'decoded') {
-          symbols[secondCandidate.index] = secondOriginal;
-          symbols[firstCandidate.index] = firstOriginal;
-          return decoded;
-        }
+        const decoded = applySymbolCorrection(symbols, [firstCandidate, secondCandidate, thirdCandidate]);
+        if (decoded.status === 'decoded') return decoded;
       }
-      symbols[secondCandidate.index] = secondOriginal;
     }
-    symbols[firstCandidate.index] = firstOriginal;
   }
   return initial;
 }

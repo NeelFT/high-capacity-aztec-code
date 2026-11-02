@@ -733,6 +733,43 @@ test('receiver corrects three low-confidence module colors when CRC validates th
   assert.deepStrictEqual(result.packet, packet);
 });
 
+test('receiver corrects four low-confidence module colors when CRC validates the packet', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(100, 93)], 'four-color-errors.bin'), 32);
+  const packet = transfer.packets[0];
+  const layout = createAztecLayout(32);
+  const matrix = renderAztecFrameMatrix(packet, 32);
+  const image = makeRenderedImage(packet, 32);
+  const palette = COLORS.map((color) => [1, 3, 5].map((offset) => parseInt(color.slice(offset, offset + 2), 16)));
+  for (const index of [31, 83, 147, 229]) {
+    const [x, y] = layout.dataCoordinates[index];
+    const sourceIndex = matrix[y * 32 + x];
+    const source = palette[sourceIndex];
+    let alternate = 0;
+    let nearestDistance = Infinity;
+    for (let color = 0; color < palette.length; color += 1) {
+      if (color === sourceIndex) continue;
+      const candidate = palette[color];
+      const distance = Math.hypot(candidate[0] - source[0], candidate[1] - source[1], candidate[2] - source[2]);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        alternate = color;
+      }
+    }
+    const alternateRgb = palette[alternate];
+    for (let pixelY = layout.matrixOffset + y * MODULE_PIXELS; pixelY < layout.matrixOffset + (y + 1) * MODULE_PIXELS; pixelY += 1) {
+      for (let pixelX = layout.matrixOffset + x * MODULE_PIXELS; pixelX < layout.matrixOffset + (x + 1) * MODULE_PIXELS; pixelX += 1) {
+        const offset = (pixelY * image.width + pixelX) * 4;
+        for (let channel = 0; channel < 3; channel += 1) {
+          image.data[offset + channel] = Math.round(source[channel] * 0.5 + alternateRgb[channel] * 0.5);
+        }
+      }
+    }
+  }
+  const result = decodeOpticalFrameDetailed(image, 32);
+  assert.equal(result.status, 'packet-decoded', `${result.reason}; confidence=${result.colourConfidence}; finder=${result.candidateConfidence}`);
+  assert.deepStrictEqual(result.packet, packet);
+});
+
 test('receiver decodes lower-resolution camera frames with blur, noise, and color cast', async () => {
   const transfer = await prepareAztecTransfer(new File([makePayload(96, 95)], 'camera-noise.bin'), 32);
   const image = addCameraBlurAndColorCast(makeOpticalFrame(transfer.packets[0], 32, 0, 360));

@@ -141,7 +141,11 @@ function updateScanStatus(trace: Omit<DecoderTrace, 'packet'>): void {
   if (trace.status === 'packet-decoded') {
     setReceiveStatus('Colorful code found—receiving file.', 'receiving');
   } else if (trace.gridSampled) {
-    setReceiveStatus('Colorful code found—reading data. Keep both screens steady.', 'detected');
+    const reason = trace.reason === 'Packet CRC32 did not match.'
+      ? 'Color mismatch—hold both screens steady while I retry.'
+      : 'Frame read, but its data was invalid. Hold both screens steady while I retry.';
+    receiveProgressText.textContent = reason;
+    setReceiveStatus(reason, 'detected');
   } else if (trace.orientationFound) {
     setReceiveStatus('Colorful code found—hold the image steady.', 'detected');
   } else if (trace.geometryCandidates > 0) {

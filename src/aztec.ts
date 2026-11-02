@@ -160,6 +160,8 @@ export interface PacketDecodeResult {
   crcValid: boolean | null;
   packet: Uint8Array | null;
   reason: string | null;
+  candidatePacket?: Uint8Array;
+  maskSeed?: number;
 }
 
 export function decode3BitPacketDetailed(symbols: Uint8Array): PacketDecodeResult {
@@ -194,7 +196,7 @@ export function decode3BitPacketDetailed(symbols: Uint8Array): PacketDecodeResul
   const packet = decode3BitPayload(symbols.subarray(0, packetSymbolCount), packetLength * 8);
   const checksumOffset = packetLength - 4;
   if (readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), checksumOffset) !== crc32(packet.subarray(0, checksumOffset))) {
-    return { status: 'crc-failed', headerValid: true, crcValid: false, packet: null, reason: 'Packet CRC32 did not match.' };
+    return { status: 'crc-failed', headerValid: true, crcValid: false, packet: null, candidatePacket: packet, reason: 'Packet CRC32 did not match.' };
   }
   return { status: 'decoded', headerValid: true, crcValid: true, packet, reason: null };
 }
