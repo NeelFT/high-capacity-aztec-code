@@ -24,7 +24,7 @@ Open the hosted app at https://neelft.github.io/high-capacity-aztec-code/ using 
 
 ### Download the offline Android app
 
-[Download the HCAC-OFT APK](https://github.com/NeelFT/high-capacity-aztec-code/raw/refs/heads/copilot/qr-web-only/downloads/HCAC-OFT-v1.0-debug.apk?download=1). This debug-signed APK includes the app locally and works offline; it needs camera permission to scan transfers and does not require internet access. Android may ask you to allow installation from your browser.
+[Download the HCAC-OFT APK](https://github.com/NeelFT/high-capacity-aztec-code/raw/refs/heads/main/downloads/HCAC-OFT-v1.0-debug.apk?download=1). This debug-signed APK includes the app locally and works offline; it needs camera permission to scan transfers and does not require internet access. Android may ask you to allow installation from your browser.
 
 ## Send a file
 
