@@ -30,5 +30,5 @@ export type WorkerResponse =
   | { type: 'packet'; frameId: number; session: number; decodedCount: number; blockCount: number; solved: number; name?: string }
   | { type: 'frameDone'; timestamp: number; counts: WorkerDiagnostics }
   | { type: 'diagnostic'; trace: Omit<DecoderTrace, 'packet'>; counts: WorkerDiagnostics }
-  | { type: 'complete'; bytes: Uint8Array; name: string; mime: string; expectedHash: string; verified: true; unique: number; solved: number }
+  | { type: 'complete'; bytes: Uint8Array; name: string; mime: string; expectedHash: string; verified: true; unique: number; solved: number; blockCount: number }
   | { type: 'error'; message: string };

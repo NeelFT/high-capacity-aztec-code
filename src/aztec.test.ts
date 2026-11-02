@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { COLORS, colorSymbolMask, createAztecLayout, crc32, decode3BitPacket, decode3BitPayload, drawAztecFrame, encode3BitPayload, EVEN_FINDER_SIZE, FINDER_RING_THICKNESS, FINDER_SIZE, FountainEquationSolver, LOCATOR_COLOR, MAX_FILE_BYTES, MODULE_PIXELS, prepareAztecTransfer, QUIET_ZONE_MODULES, renderAztecFrameMatrix, sha256Hex, solveFountainEquations } from './aztec.ts';
-import { decodeOpticalFrame, decodeOpticalFrameDetailed } from './image-decoder.ts';
+import { decodeOpticalFrame, decodeOpticalFrameDetailed, trackBullseye } from './image-decoder.ts';
 import { decompressGzip } from './compression.ts';
 import type { PixelImage } from './image-decoder.ts';
 
@@ -54,9 +54,15 @@ function addCameraBlurAndColorCast(image: PixelImage): PixelImage {
   return { width: image.width, height: image.height, data };
 }
 
-function makeRenderedImage(packet: Uint8Array, matrixSize: number, includeLocator = true): PixelImage {
-  const layout = createAztecLayout(matrixSize);
-  const matrix = renderAztecFrameMatrix(packet, matrixSize);
+function makeRenderedImage(
+  packet: Uint8Array,
+  matrixSize: number,
+  includeLocator = true,
+  perimeterColor: '#000000' | '#FFFFFF' = '#FFFFFF',
+  perimeterWidth = 1,
+): PixelImage {
+  const layout = createAztecLayout(matrixSize, perimeterColor, perimeterWidth);
+  const matrix = renderAztecFrameMatrix(packet, matrixSize, perimeterColor, perimeterWidth);
   const modulePixels = 6;
   const width = layout.frameSize;
   const data = new Uint8ClampedArray(width * width * 4);
@@ -125,8 +131,16 @@ function addDarkCameraBackground(image: PixelImage, size: number): PixelImage {
   return { width: size, height: size, data };
 }
 
-function makeOpticalFrame(packet: Uint8Array, matrixSize: number, rotation = 0, imageSize = 720, includeLocator = true): PixelImage {
-  const sourceImage = makeRenderedImage(packet, matrixSize, includeLocator);
+function makeOpticalFrame(
+  packet: Uint8Array,
+  matrixSize: number,
+  rotation = 0,
+  imageSize = 720,
+  includeLocator = true,
+  perimeterColor: '#000000' | '#FFFFFF' = '#FFFFFF',
+  perimeterWidth = 1,
+): PixelImage {
+  const sourceImage = makeRenderedImage(packet, matrixSize, includeLocator, perimeterColor, perimeterWidth);
   const sourceSize = sourceImage.width;
   const source = sourceImage.data;
   const width = imageSize;
@@ -256,10 +270,39 @@ function translateImage(image: PixelImage, dx: number, dy: number): PixelImage {
   return { width: image.width, height: image.height, data };
 }
 
+function rotateImage(image: PixelImage, degrees: number): PixelImage {
+  const size = Math.ceil(Math.max(image.width, image.height) * 1.5);
+  const data = new Uint8ClampedArray(size * size * 4);
+  for (let index = 0; index < size * size; index += 1) {
+    data[index * 4] = 255;
+    data[index * 4 + 1] = 255;
+    data[index * 4 + 2] = 255;
+    data[index * 4 + 3] = 255;
+  }
+  const center = size / 2;
+  const imageCenterX = image.width / 2;
+  const imageCenterY = image.height / 2;
+  const angle = degrees * Math.PI / 180;
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const relativeX = x - center;
+      const relativeY = y - center;
+      const sourceX = Math.round(cosine * relativeX + sine * relativeY + imageCenterX);
+      const sourceY = Math.round(-sine * relativeX + cosine * relativeY + imageCenterY);
+      if (sourceX < 0 || sourceX >= image.width || sourceY < 0 || sourceY >= image.height) continue;
+      const sourceOffset = (sourceY * image.width + sourceX) * 4;
+      data.set(image.data.subarray(sourceOffset, sourceOffset + 4), (y * size + x) * 4);
+    }
+  }
+  return { width: size, height: size, data };
+}
+
 function makeLegacyRenderedImage(packet: Uint8Array, matrixSize: number): PixelImage {
-  const image = makeRenderedImage(packet, matrixSize);
+  const image = makeRenderedImage(packet, matrixSize, true, '#000000', 3);
   const data = new Uint8ClampedArray(image.data);
-  const layout = createAztecLayout(matrixSize);
+  const layout = createAztecLayout(matrixSize, '#000000', 3);
   const symbols = encode3BitPayload(packet);
   const frameId = new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint32(0, true);
   const rgb = COLORS.map((color) => [
@@ -347,6 +390,42 @@ test('small image translations preserve detected frame corner accuracy', async (
   assert.ok(minimumMaximumError <= 2, `translated corners drifted by ${minimumMaximumError.toFixed(2)} pixels`);
 });
 
+test('bullseye tracking keeps the QR anchored as the camera image moves', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(80, 29)], 'bullseye-track.bin'), 32);
+  const image = makeOpticalFrame(transfer.packets[0], 32);
+  const baseline = decodeOpticalFrameDetailed(image, 32);
+  assert.equal(baseline.status, 'packet-decoded', baseline.reason);
+  assert.ok(baseline.corners && baseline.finderCorners);
+
+  const dx = 44;
+  const dy = -28;
+  const movedImage = translateImage(image, dx, dy);
+  const tracked = trackBullseye(movedImage, image, baseline.corners, baseline.finderCorners);
+  assert.ok(tracked, 'bullseye should remain trackable after camera movement');
+  assert.ok(tracked.score > 0.9, `bullseye match confidence was only ${tracked.score}`);
+  const trackedFinderCenter = tracked.finderCorners.reduce(
+    (center, point) => ({ x: center.x + point.x / 4, y: center.y + point.y / 4 }),
+    { x: 0, y: 0 },
+  );
+  const baselineFinderCenter = baseline.finderCorners.reduce(
+    (center, point) => ({ x: center.x + point.x / 4, y: center.y + point.y / 4 }),
+    { x: 0, y: 0 },
+  );
+  assert.ok(Math.abs(trackedFinderCenter.x - baselineFinderCenter.x - dx) <= 2,
+    `bullseye x shift was ${trackedFinderCenter.x - baselineFinderCenter.x}; center ${baselineFinderCenter.x} to ${trackedFinderCenter.x}`);
+  assert.ok(Math.abs(trackedFinderCenter.y - baselineFinderCenter.y - dy) <= 2,
+    `bullseye y shift was ${trackedFinderCenter.y - baselineFinderCenter.y}`);
+  for (let index = 0; index < baseline.corners.length; index += 1) {
+    assert.ok(Math.abs(tracked.corners[index].x - baseline.corners[index].x - dx) <= 8,
+      `corner ${index} x shift was ${tracked.corners[index].x - baseline.corners[index].x}`);
+    assert.ok(Math.abs(tracked.corners[index].y - baseline.corners[index].y - dy) <= 8,
+      `corner ${index} y shift was ${tracked.corners[index].y - baseline.corners[index].y}`);
+  }
+  const decoded = decodeOpticalFrameDetailed(movedImage, 32, tracked.corners, baseline.locatorDetected);
+  assert.equal(decoded.status, 'packet-decoded', decoded.reason);
+  assert.deepStrictEqual(decoded.packet, transfer.packets[0]);
+});
+
 test('receiver reacquires the frame when tracked corners no longer decode it', async () => {
   const transfer = await prepareAztecTransfer(new File([makePayload(80, 31)], 'reacquire-test.bin'), 32);
   const image = makeOpticalFrame(transfer.packets[0], 32);
@@ -364,9 +443,9 @@ test('receiver reacquires the frame when tracked corners no longer decode it', a
 });
 
 test('receiver falls back to the dark boundary when no locator border is present', async () => {
-  const transfer = await prepareAztecTransfer(new File([makePayload(80, 71)], 'legacy-boundary.bin'), 32);
-  const unmarkedImage = makeOpticalFrame(transfer.packets[0], 32, 0, 720, false);
-  const result = decodeOpticalFrameDetailed(unmarkedImage, 32);
+  const transfer = await prepareAztecTransfer(new File([makePayload(8, 71)], 'x'), 32);
+  const unmarkedImage = makeOpticalFrame(transfer.packets[0], 63, 0, 720, false, '#000000', 3);
+  const result = decodeOpticalFrameDetailed(unmarkedImage, 63);
   assert.equal(result.status, 'packet-decoded', result.reason);
   assert.equal(result.locatorDetected, false);
   assert.deepStrictEqual(result.packet, transfer.packets[0]);
@@ -436,6 +515,7 @@ test('renderer redraws every module and changes frame-dependent padding', async 
   const firstPacket = transfer.packets[0];
   const nextPacket = transfer.packets[1];
   const size = transfer.targetMatrixSize;
+  const layout = createAztecLayout(size);
   const canvas = {
     width: 0,
     height: 0,
@@ -453,7 +533,7 @@ test('renderer redraws every module and changes frame-dependent padding', async 
       }
       assert.equal(width, 6);
       assert.equal(height, 6);
-      draws.set(((y - 12) / 6) * size + (x - 12) / 6, fillStyle);
+      draws.set(((y - layout.matrixOffset) / 6) * size + (x - layout.matrixOffset) / 6, fillStyle);
     },
     set fillStyle(value: string) { fillStyle = value; },
     get fillStyle() { return fillStyle; },
@@ -462,18 +542,18 @@ test('renderer redraws every module and changes frame-dependent padding', async 
   const first = drawAztecFrame(firstPacket, canvas, size);
   const firstMatrix = renderAztecFrameMatrix(firstPacket, size);
   assert.equal(extraColorFills, 4, 'new frames should paint a clear orange locator border around the quiet zone');
-  assert.equal(first.width, (size + 4) * 6);
-  assert.equal(first.height, (size + 4) * 6);
+  assert.equal(first.width, (size + 2) * 6 + 4);
+  assert.equal(first.height, (size + 2) * 6 + 4);
   assert.equal(draws.size, size * size, 'every matrix module, including corners, must be redrawn');
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
       assert.equal(draws.get(y * size + x), COLORS[firstMatrix[y * size + x]]);
     }
   }
-  assert.equal(firstMatrix[0], 0);
-  assert.equal(firstMatrix[size - 1], 0);
-  assert.equal(firstMatrix[(size - 1) * size], 0);
-  assert.equal(firstMatrix[size * size - 1], 0);
+  assert.equal(firstMatrix[0], 7);
+  assert.equal(firstMatrix[size - 1], 7);
+  assert.equal(firstMatrix[(size - 1) * size], 7);
+  assert.equal(firstMatrix[size * size - 1], 7);
 
   const second = drawAztecFrame(nextPacket, canvas, size);
   const secondMatrix = renderAztecFrameMatrix(nextPacket, size);
@@ -514,10 +594,17 @@ test('32x32 and 63x63 layouts share a centered fixed-size finder and disjoint da
     assert.equal(layout.finderSize, size === 32 ? 8 : 9);
     assert.equal(layout.finderCenter, size / 2);
     assert.equal(layout.finderStart, (size - layout.finderSize) / 2);
-    assert.equal(layout.matrixOffset, QUIET_ZONE_MODULES * MODULE_PIXELS);
-    assert.equal(layout.frameSize, (size + QUIET_ZONE_MODULES * 2) * MODULE_PIXELS);
+    assert.equal(layout.matrixOffset, QUIET_ZONE_MODULES * MODULE_PIXELS + 2);
+    assert.equal(layout.frameSize, (size + QUIET_ZONE_MODULES * 2) * MODULE_PIXELS + 4);
+    for (let index = 0; index < size; index += 1) {
+      assert.equal(layout.grid[0][index], '#FFFFFF');
+      assert.equal(layout.grid[size - 1][index], '#FFFFFF');
+      assert.equal(layout.grid[index][0], '#FFFFFF');
+      assert.equal(layout.grid[index][size - 1], '#FFFFFF');
+    }
 
     const data = new Set(layout.dataCoordinates.map(([x, y]) => `${x},${y}`));
+    assert.ok(data.has('3,1'), 'the internal white border should be one module thick');
     for (const structural of layout.alignmentCoordinates) assert.equal(data.has(structural), false);
     for (let ring = 0; ring < Math.ceil(layout.finderSize / 2); ring += 1) {
       const expected = Math.floor(ring / FINDER_RING_THICKNESS) % 2 === 0 ? '#000000' : '#FFFFFF';
@@ -550,13 +637,13 @@ test('32x32 and 63x63 layouts share a centered fixed-size finder and disjoint da
   }
 });
 
-test('32x32 frames carry and decode valid packets while 24x24 remains below protocol capacity', async () => {
+test('32x32 and compact 24x24 frames carry and decode valid packets', async () => {
   const file = new File([new TextEncoder().encode('HCAC test')], 'hcac-self-test.txt', { type: 'text/plain' });
   const transfer = await prepareAztecTransfer(file, 32);
   const layout = createAztecLayout(32);
   assert.equal(transfer.targetMatrixSize, 32);
   assert.equal(transfer.blockCount, 1, 'the 32x32 decoder self-test must fit in one frame');
-  assert.equal(createAztecLayout(32).frameSize, 216);
+  assert.equal(createAztecLayout(32).frameSize, 208);
   assert.equal(renderAztecFrameMatrix(transfer.packets[0], 32).length, 32 * 32);
   for (const packet of transfer.packets) {
     const matrix = renderAztecFrameMatrix(packet, 32);
@@ -568,8 +655,12 @@ test('32x32 frames carry and decode valid packets while 24x24 remains below prot
   }
   assert.ok(transfer.blockSize > 0);
 
-  assert.equal(Math.floor(createAztecLayout(24).dataCoordinates.length * 3 / 8), 79);
-  await assert.rejects(prepareAztecTransfer(file, 24), /cannot fit a safe fountain packet/);
+  assert.equal(Math.floor(createAztecLayout(24).dataCoordinates.length * 3 / 8), 139);
+  const compactTransfer = await prepareAztecTransfer(file, 24);
+  assert.ok(compactTransfer.blockCount > 0, 'the 24x24 frame should fit the short test transfer');
+  const compactTrace = decodeOpticalFrameDetailed(makeRenderedImage(compactTransfer.packets[0], 24), 24);
+  assert.equal(compactTrace.status, 'packet-decoded', compactTrace.reason);
+  assert.deepStrictEqual(compactTrace.packet, compactTransfer.packets[0]);
 });
 
 test('receiver uses CRC-backed color recovery for ambiguous module samples', async () => {
@@ -681,9 +772,10 @@ test('actual sender render decodes in the receiver pipeline at varied brightness
   assert.equal(trackedFrame.locatorDetected, true);
   assert.equal(trackedFrame.trackedCandidate, true);
   assert.equal(trackedFrame.candidateCount, 0, 'tracked reads must not inflate newly detected candidate counts');
-  const legacyFrame = decodeOpticalFrameDetailed(makeLegacyRenderedImage(transfer.packets[0], transfer.targetMatrixSize), transfer.targetMatrixSize);
+  const legacyTransfer = await prepareAztecTransfer(new File([makePayload(8, 77)], 'x'), 32);
+  const legacyFrame = decodeOpticalFrameDetailed(makeLegacyRenderedImage(legacyTransfer.packets[0], 63), 63);
   assert.equal(legacyFrame.status, 'packet-decoded', `legacy color mapping failed: ${legacyFrame.reason}`);
-  assert.deepStrictEqual(legacyFrame.packet, transfer.packets[0]);
+  assert.deepStrictEqual(legacyFrame.packet, legacyTransfer.packets[0]);
   const corruptedPacket = transfer.packets[0].slice();
   corruptedPacket[corruptedPacket.length - 5] ^= 0x80;
   corruptedPacket[corruptedPacket.length - 9] ^= 0x35;
@@ -782,12 +874,12 @@ test('incremental fountain solver handles out-of-order and repeated equations', 
   assert.equal(solver.addEquation([0, 0], new Uint8Array([0, 0])), false, 'duplicate block indices must be rejected');
 });
 
-test('32x32 transfer packets combine in reverse order when metadata arrives last', async () => {
+test('32x32 transfer can recover when the first QR is missing', async () => {
   const source = makePseudoRandomPayload(512, 83);
   const transfer = await prepareAztecTransfer(new File([source], 'reverse-order.bin', { type: 'application/octet-stream' }), 32);
   assert.ok(transfer.blockCount > 1);
   const solver = new FountainEquationSolver(transfer.blockCount, transfer.blockSize);
-  let metadataPacketSeen = false;
+  let transferMetadata: Uint8Array | null = null;
   for (const packet of [...transfer.packets].reverse()) {
     const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
     const frameId = view.getUint32(0, true);
@@ -799,12 +891,17 @@ test('32x32 transfer packets combine in reverse order when metadata arrives last
       offset += 2;
     }
     const metadataLength = packet[offset++];
-    if (frameId === 0) metadataPacketSeen = true;
-    else assert.equal(metadataPacketSeen, false, 'the metadata packet should arrive after every later frame ID');
+    const packetMetadata = packet.subarray(offset, offset + metadataLength);
+    assert.ok(metadataLength > 1, `frame ${frameId} should include complete transfer metadata`);
+    if (transferMetadata) {
+      assert.deepStrictEqual(packetMetadata, transferMetadata, `frame ${frameId} should repeat transfer metadata`);
+    } else {
+      transferMetadata = packetMetadata.slice();
+    }
     offset += metadataLength;
+    if (frameId === 0) continue;
     assert.equal(solver.addEquation(indices, packet.subarray(offset, offset + transfer.blockSize)), true);
   }
-  assert.equal(metadataPacketSeen, true);
   assert.equal(solver.solved.size, transfer.blockCount);
   const reconstructed = new Uint8Array(transfer.encodedBytes);
   for (let index = 0; index < transfer.blockCount; index += 1) {
@@ -878,7 +975,7 @@ test('gzip compression reduces frame count and receiver restores the original fi
     'binary SHA-256 metadata should save 32 bytes versus hexadecimal');
   const capacity = Math.floor(createAztecLayout(32).dataCoordinates.length * 3 / 8);
   const legacyMetadataLength = 1 + 1 + plainNameLength + 1 + plainTypeLength + 1 + 64;
-  const legacyBlockSize = Math.min(capacity - 26 - 24 * 2 - 1, capacity - 26 - 2 - legacyMetadataLength);
+  const legacyBlockSize = Math.min(capacity - 26 - 24 * 2 - 1, capacity - 26 - 24 * 2 - legacyMetadataLength);
   const legacyBlockCount = Math.ceil(noise.length / legacyBlockSize);
   assert.ok(uncompressed.blockSize > legacyBlockSize, 'compact metadata should free first-packet capacity for file data');
   assert.ok(uncompressed.frameCount < legacyBlockCount + Math.ceil(legacyBlockCount * 1.5),
@@ -907,6 +1004,16 @@ test('32x32 and 63x63 camera frames rectify perspective and identify quarter-tur
         assert.deepStrictEqual(decoded.packet, packet, `packet mismatch for ${matrixSize}x${matrixSize} at ${imageSize}px and ${rotation * 90} degrees`);
       }
     }
+  }
+});
+
+test('receiver decodes frames rotated to arbitrary angles', async () => {
+  const transfer = await prepareAztecTransfer(new File([makePayload(96, 123)], 'angled-frame.bin'), 32);
+  for (const angle of [15, 33, 45, 72, 123, 177]) {
+    const rotated = rotateImage(makeOpticalFrame(transfer.packets[0], 32), angle);
+    const trace = decodeOpticalFrameDetailed(rotated, 32);
+    assert.equal(trace.status, 'packet-decoded', `${angle} degree rotation: ${trace.reason}; candidates=${trace.candidateCount}; corners=${JSON.stringify(trace.corners)}`);
+    assert.deepStrictEqual(trace.packet, transfer.packets[0], `${angle} degree rotation returned different data`);
   }
 });
 

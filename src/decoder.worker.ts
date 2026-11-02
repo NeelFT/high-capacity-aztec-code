@@ -1,20 +1,24 @@
-import { crc32, FountainEquationSolver, MAX_BLOCK_COUNT, MAX_EQUATION_DEGREE, MAX_FILE_BYTES, readU16, readU32, sha256Hex } from './aztec';
-import { decompressGzip } from './compression';
-import { decodeOpticalFrameDetailed } from './image-decoder';
+import { crc32, FountainEquationSolver, MAX_BLOCK_COUNT, MAX_EQUATION_DEGREE, MAX_FILE_BYTES, readU16, readU32 } from './aztec';
+import { decodeOpticalFrameDetailed, trackBullseye } from './image-decoder';
 import type { DecoderTrace, FrameCorners, PixelImage } from './image-decoder';
 import { deleteReceivedPackets, loadReceivedPackets, saveReceivedPacket } from './packet-store';
+import type { ReconstructionRequest, ReconstructionResponse } from './reconstruction-protocol';
 import type { WorkerDiagnostics, WorkerRequest, WorkerResponse } from './worker-protocol';
 
 let lastSession: number | null = null;
 let decodedCount = 0;
 let running = false;
 let completionSent = false;
+let reconstructionStarted = false;
+let reconstructionWorker: Worker | null = null;
 let blockCount = 0;
 let blockSize = 0;
 let totalBytes = 0;
 let metadata: { name: string; type: string; hash: string; compression: 'gzip' | null; originalSize: number | null } | null = null;
 let targetMatrixSize = 63;
 let lastCorners: FrameCorners | null = null;
+let lastFinderCorners: FrameCorners | null = null;
+let lastImage: PixelImage | null = null;
 let lastLocatorDetected = false;
 let trackedImageSize: [number, number] | null = null;
 let trackingMisses = 0;
@@ -43,6 +47,7 @@ const diagnosticCounts: WorkerDiagnostics = {
 const receivedFrames = new Set<number>();
 let solver: FountainEquationSolver | null = null;
 let hydratedSession: number | null = null;
+let packetSaveQueue = Promise.resolve();
 
 function postWorkerMessage(message: WorkerResponse, transfer?: Transferable[]): void {
   (self as unknown as { postMessage(value: WorkerResponse, transfer?: Transferable[]): void }).postMessage(message, transfer);
@@ -88,6 +93,8 @@ function updateTracking(trace: DecoderTrace): void {
     trackingFrames = 0;
     if (!lastCorners || trackingMisses > 4) {
       lastCorners = null;
+      lastFinderCorners = null;
+      lastImage = null;
       lastLocatorDetected = false;
       trackedImageSize = null;
       diagnosticCounts.trackingState = 'SEARCHING';
@@ -137,6 +144,7 @@ function rememberCorners(trace: DecoderTrace): void {
     lastCorners = trace.corners;
   }
   lastLocatorDetected = trace.locatorDetected;
+  if (trace.finderCorners) lastFinderCorners = trace.finderCorners;
   trackedImageSize = [trace.imageWidth, trace.imageHeight];
 }
 
@@ -337,12 +345,15 @@ async function restorePacketsForSession(session: number, trace: DecoderTrace): P
 }
 
 function resetSession(value: number): void {
+  reconstructionWorker?.terminate();
+  reconstructionWorker = null;
   lastSession = value;
   decodedCount = 0;
   blockCount = 0;
   blockSize = 0;
   totalBytes = 0;
   completionSent = false;
+  reconstructionStarted = false;
   metadata = null;
   receivedFrames.clear();
   solver = null;
@@ -351,70 +362,88 @@ function resetSession(value: number): void {
 
 async function completeIfSolved(): Promise<void> {
   const solved = solver?.solved;
-  if (completionSent || !metadata || !solver || !solved || solved.size < blockCount) return;
+  if (completionSent || reconstructionStarted || !metadata || !solver || !solved || solved.size < blockCount) return;
   for (let index = 0; index < blockCount; index += 1) {
     if (!solved.has(index)) return;
   }
-  const encodedBytes = new Uint8Array(totalBytes);
-  for (let index = 0; index < blockCount; index += 1) {
-    const block = solved.get(index);
-    if (!block) return;
-    const start = index * blockSize;
-    encodedBytes.set(block.subarray(0, Math.min(blockSize, encodedBytes.length - start)), start);
-  }
-  let bytes = encodedBytes;
-  if (metadata.compression === 'gzip') {
-    try {
-      if (metadata.originalSize === null) throw new Error('Compressed transfer is missing its original size.');
-      const decompressed = await decompressGzip(encodedBytes, metadata.originalSize);
-      bytes = new Uint8Array(decompressed.byteLength);
-      bytes.set(decompressed);
-    } catch (error) {
-      completionSent = true;
-      diagnosticCounts.verification = 'FAILED';
-      diagnosticCounts.latestError = error instanceof Error ? `Compressed transfer could not be decompressed: ${error.message}` : 'Compressed transfer could not be decompressed.';
-      if (latestTrace) reportDiagnostic(latestTrace);
-      postWorkerMessage({ type: 'error', message: diagnosticCounts.latestError });
-      return;
-    }
-    if (metadata.originalSize === null || bytes.length !== metadata.originalSize || bytes.length > MAX_FILE_BYTES) {
-      completionSent = true;
-      diagnosticCounts.verification = 'FAILED';
-      diagnosticCounts.latestError = 'Compressed transfer size does not match its validated metadata.';
-      if (latestTrace) reportDiagnostic(latestTrace);
-      postWorkerMessage({ type: 'error', message: diagnosticCounts.latestError });
-      return;
-    }
-  }
-  const actualHash = await sha256Hex(bytes);
-  if (actualHash !== metadata.hash) {
+  reconstructionStarted = true;
+  const activeMetadata = metadata;
+  const activeSession = lastSession ?? 0;
+  const activeDecodedCount = decodedCount;
+  const blocks = Array.from(solved, ([index, data]) => ({ index, data: data.slice() }));
+  const request: ReconstructionRequest = {
+    type: 'reconstruct',
+    blocks,
+    blockCount,
+    blockSize,
+    totalBytes,
+    metadata: activeMetadata,
+  };
+  let worker: Worker;
+  try {
+    worker = new Worker(new URL('./reconstruction.worker.ts', import.meta.url), { type: 'module' });
+  } catch (error) {
+    reconstructionStarted = false;
+    const message = error instanceof Error ? `Could not start file reconstruction: ${error.message}` : 'Could not start file reconstruction.';
     completionSent = true;
     diagnosticCounts.verification = 'FAILED';
-    diagnosticCounts.latestError = 'Transfer integrity failure: reconstructed file hash mismatch.';
+    diagnosticCounts.latestError = message;
     if (latestTrace) reportDiagnostic(latestTrace);
-    postWorkerMessage({ type: 'error', message: 'Transfer integrity failure: reconstructed file hash mismatch.' });
+    postWorkerMessage({ type: 'error', message });
     return;
   }
-  completionSent = true;
-  diagnosticCounts.verification = 'VERIFIED';
+  reconstructionWorker = worker;
+  const failReconstruction = (message: string): void => {
+    if (reconstructionWorker !== worker) return;
+    reconstructionWorker = null;
+    worker.terminate();
+    completionSent = true;
+    diagnosticCounts.verification = 'FAILED';
+    diagnosticCounts.latestError = message;
+    if (latestTrace) reportDiagnostic(latestTrace);
+    postWorkerMessage({ type: 'error', message });
+  };
+  worker.onmessage = async (event: MessageEvent<ReconstructionResponse>) => {
+    if (reconstructionWorker !== worker) return;
+    const response = event.data;
+    if (response.type === 'error') {
+      failReconstruction(response.message);
+      return;
+    }
+    reconstructionWorker = null;
+    worker.terminate();
+    completionSent = true;
+    diagnosticCounts.verification = 'VERIFIED';
+    try {
+      await packetSaveQueue;
+      await deleteReceivedPackets(activeSession);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unknown IndexedDB error.';
+      diagnosticCounts.latestError = `File verified, but saved packet cleanup failed: ${reason}`;
+    }
+    if (lastSession !== activeSession) return;
+    if (latestTrace) reportDiagnostic(latestTrace);
+    postWorkerMessage({
+      type: 'complete',
+      bytes: response.bytes,
+      name: activeMetadata.name,
+      mime: activeMetadata.type,
+      expectedHash: activeMetadata.hash,
+      verified: true,
+      unique: activeDecodedCount,
+      solved: blockCount,
+      blockCount,
+    }, [response.bytes.buffer]);
+    running = false;
+  };
+  worker.onerror = (event: ErrorEvent) => {
+    failReconstruction(`File reconstruction worker failed: ${event.message || 'Unknown worker error.'}`);
+  };
   try {
-    await deleteReceivedPackets(lastSession ?? 0);
+    worker.postMessage(request, blocks.map(({ data }) => data.buffer));
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'Unknown IndexedDB error.';
-    diagnosticCounts.latestError = `File verified, but saved packet cleanup failed: ${reason}`;
+    failReconstruction(error instanceof Error ? `Could not send file blocks for reconstruction: ${error.message}` : 'Could not send file blocks for reconstruction.');
   }
-  if (latestTrace) reportDiagnostic(latestTrace);
-  postWorkerMessage({
-    type: 'complete',
-    bytes,
-    name: metadata.name,
-    mime: metadata.type,
-    expectedHash: metadata.hash,
-    verified: true,
-    unique: decodedCount,
-    solved: solved.size,
-  }, [bytes.buffer]);
-  running = false;
 }
 
 async function publish(image: PixelImage): Promise<void> {
@@ -429,9 +458,19 @@ async function publish(image: PixelImage): Promise<void> {
     trackingFrames = 0;
   }
   const trackedCorners = trackingMisses < 3 ? lastCorners : null;
-  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, trackedCorners, lastLocatorDetected);
+  const bullseyeTrack = lastImage && lastFinderCorners && trackedCorners
+    ? trackBullseye(image, lastImage, trackedCorners, lastFinderCorners)
+    : null;
+  const anchorCorners = bullseyeTrack?.corners ?? trackedCorners;
+  const trace = decodeOpticalFrameDetailed(image, targetMatrixSize, anchorCorners, lastLocatorDetected);
+  if (bullseyeTrack && trace.trackedCandidate) trace.finderCorners = bullseyeTrack.finderCorners;
   latestTrace = trace;
   updateTracking(trace);
+  if (trace.corners && trace.finderCorners && trace.orientationFound) {
+    lastImage = { width: image.width, height: image.height, data: new Uint8ClampedArray(image.data) };
+  } else if (trackingMisses > 0) {
+    lastImage = null;
+  }
   updateTrace(trace);
   if (!trace.packet) {
     reportDiagnostic(trace);
@@ -460,12 +499,16 @@ async function publish(image: PixelImage): Promise<void> {
     return;
   }
   if (!accepted) return;
-  try {
-    await saveReceivedPacket(parsed.session, parsed.frameId, trace.packet);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : 'Unknown IndexedDB error.';
-    diagnosticCounts.latestError = `Packet accepted for this scan but could not be saved for later: ${reason}`;
-  }
+  const savedPacket = trace.packet.slice();
+  packetSaveQueue = packetSaveQueue.then(async () => {
+    try {
+      await saveReceivedPacket(parsed.session, parsed.frameId, savedPacket);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unknown IndexedDB error.';
+      diagnosticCounts.latestError = `Packet accepted for this scan but could not be saved for later: ${reason}`;
+      if (latestTrace) reportDiagnostic(latestTrace);
+    }
+  });
   reportDiagnostic(trace);
   await completeIfSolved();
   const activeSolver = solver;
@@ -488,6 +531,8 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     resetSession(0);
     lastSession = null;
     lastCorners = null;
+    lastFinderCorners = null;
+    lastImage = null;
     lastLocatorDetected = false;
     trackedImageSize = null;
     trackingMisses = 0;
@@ -499,6 +544,8 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     resetSession(0);
     lastSession = null;
     lastCorners = null;
+    lastFinderCorners = null;
+    lastImage = null;
     lastLocatorDetected = false;
     trackedImageSize = null;
     trackingMisses = 0;

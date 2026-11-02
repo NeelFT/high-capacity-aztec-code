@@ -4,7 +4,8 @@ export const FINDER_SIZE = 9;
 export const EVEN_FINDER_SIZE = FINDER_SIZE - 1;
 export const FINDER_RING_THICKNESS = 1;
 export const MODULE_PIXELS = 6;
-export const QUIET_ZONE_MODULES = 2;
+export const QUIET_ZONE_MODULES = 1;
+const FRAME_EDGE_GAP_PIXELS = 2;
 export const COLORS = ['#000000', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF', '#FFFFFF'] as const;
 export const LOCATOR_COLOR = '#FF8000';
 export const REDUNDANCY = 1.5;
@@ -460,7 +461,11 @@ function validateMatrixSize(targetMatrixSize: number): number {
   return targetMatrixSize;
 }
 
-export function createAztecLayout(targetMatrixSize: number): AztecLayout {
+export function createAztecLayout(
+  targetMatrixSize: number,
+  perimeterColor: '#000000' | '#FFFFFF' = '#FFFFFF',
+  perimeterWidth = 1,
+): AztecLayout {
   const size = validateMatrixSize(targetMatrixSize);
   const center = Math.floor(size / 2);
   const finderSize = size % 2 === 0 ? EVEN_FINDER_SIZE : FINDER_SIZE;
@@ -473,12 +478,12 @@ export function createAztecLayout(targetMatrixSize: number): AztecLayout {
       alignmentCoordinates.add(`${x},${y}`);
     }
   };
-  for (let edge = 0; edge < 3; edge += 1) {
+  for (let edge = 0; edge < perimeterWidth; edge += 1) {
     for (let index = 0; index < size; index += 1) {
-      setStructural(index, edge, '#000000');
-      setStructural(index, size - 1 - edge, '#000000');
-      setStructural(edge, index, '#000000');
-      setStructural(size - 1 - edge, index, '#000000');
+      setStructural(index, edge, perimeterColor);
+      setStructural(index, size - 1 - edge, perimeterColor);
+      setStructural(edge, index, perimeterColor);
+      setStructural(size - 1 - edge, index, perimeterColor);
     }
   }
   for (let y = finderStart; y < finderStart + finderSize; y += 1) {
@@ -511,10 +516,10 @@ export function createAztecLayout(targetMatrixSize: number): AztecLayout {
       if (!onPerimeter && grid[y][x] === null) dataCoordinates.push([x, y]);
     }
   }
-  const matrixOffset = QUIET_ZONE_MODULES * MODULE_PIXELS;
+  const matrixOffset = QUIET_ZONE_MODULES * MODULE_PIXELS + FRAME_EDGE_GAP_PIXELS;
   return {
     targetMatrixSize: size,
-    frameSize: (size + QUIET_ZONE_MODULES * 2) * MODULE_PIXELS,
+    frameSize: (size + QUIET_ZONE_MODULES * 2) * MODULE_PIXELS + FRAME_EDGE_GAP_PIXELS * 2,
     matrixOffset,
     finderCenter: size / 2,
     finderStart,
@@ -534,7 +539,7 @@ function framePayloadSize(layout: AztecLayout, metadataLength: number): number {
   const maxDegree = Math.min(MAX_EQUATION_DEGREE, MAX_BLOCK_COUNT);
   const checksumAndHeader = PACKET_FIXED_BYTES + 4;
   const maxRepairPayload = capacity - checksumAndHeader - maxDegree * 2 - 1;
-  const metadataPacketPayload = capacity - checksumAndHeader - 2 - metadataLength;
+  const metadataPacketPayload = capacity - checksumAndHeader - maxDegree * 2 - metadataLength;
   const available = Math.min(MAX_BLOCK_SIZE, maxRepairPayload, metadataPacketPayload);
   if (available < 1) {
     throw new Error(`Matrix ${layout.targetMatrixSize}x${layout.targetMatrixSize} cannot fit a safe fountain packet. Choose a larger matrix.`);
@@ -639,9 +644,7 @@ export function prepareAztecTransfer(file: File, targetMatrixSize: number, onPro
         const indices = frameId < blockCount ? [frameId] : chooseSubset(seed, blockCount);
         const payload = new Uint8Array(blockSize);
         for (const index of indices) xorInto(payload, blocks[index]);
-        const packetMetadata = frameId === 0
-          ? metadata
-          : new Uint8Array([0]);
+        const packetMetadata = metadata;
         const packetLength = PACKET_FIXED_BYTES + indices.length * 2 + packetMetadata.length + blockSize + 4;
         let packet = new Uint8Array(packetLength);
         const view = new DataView(packet.buffer);
@@ -715,8 +718,13 @@ export interface AztecFrameRenderResult {
   height: number;
 }
 
-export function renderAztecFrameMatrix(packet: Uint8Array, targetMatrixSize: number): Uint8Array {
-  const layout = createAztecLayout(targetMatrixSize);
+export function renderAztecFrameMatrix(
+  packet: Uint8Array,
+  targetMatrixSize: number,
+  perimeterColor: '#000000' | '#FFFFFF' = '#FFFFFF',
+  perimeterWidth = 1,
+): Uint8Array {
+  const layout = createAztecLayout(targetMatrixSize, perimeterColor, perimeterWidth);
   const dataColors = renderDataColors(packet, layout);
   const matrix = new Uint8Array(layout.targetMatrixSize * layout.targetMatrixSize);
   for (let y = 0; y < layout.targetMatrixSize; y += 1) {

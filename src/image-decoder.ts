@@ -15,6 +15,14 @@ export interface FramePoint {
 
 export type FrameCorners = [FramePoint, FramePoint, FramePoint, FramePoint];
 
+const LEGACY_PERIMETER_WIDTH = 3;
+
+export interface BullseyeTrack {
+  corners: FrameCorners;
+  finderCorners: FrameCorners;
+  score: number;
+}
+
 export interface DecoderTrace {
   status: 'candidate-not-found' | 'geometry-failed' | 'orientation-failed' | 'grid-sampling-failed' | 'colour-recognition-failed' | 'header-invalid' | 'crc-failed' | 'packet-decoded';
   candidateCount: number;
@@ -67,9 +75,200 @@ function isLocatorPixel(image: PixelImage, x: number, y: number): boolean {
   return red > 35 && red - green > 10 && green - blue > 8 && red > green * 1.1 && green > blue * 1.1;
 }
 
+function sampleLuminance(image: PixelImage, point: FramePoint): number {
+  const x = Math.max(0, Math.min(image.width - 1, Math.round(point.x)));
+  const y = Math.max(0, Math.min(image.height - 1, Math.round(point.y)));
+  const offset = (y * image.width + x) * 4;
+  const alpha = image.data[offset + 3] / 255;
+  const red = image.data[offset] * alpha + 255 * (1 - alpha);
+  const green = image.data[offset + 1] * alpha + 255 * (1 - alpha);
+  const blue = image.data[offset + 2] * alpha + 255 * (1 - alpha);
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+}
+
+function interpolateCorners(corners: FrameCorners, u: number, v: number): FramePoint {
+  const [topLeft, topRight, bottomRight, bottomLeft] = corners;
+  return {
+    x: (1 - u) * (1 - v) * topLeft.x + u * (1 - v) * topRight.x + u * v * bottomRight.x + (1 - u) * v * bottomLeft.x,
+    y: (1 - u) * (1 - v) * topLeft.y + u * (1 - v) * topRight.y + u * v * bottomRight.y + (1 - u) * v * bottomLeft.y,
+  };
+}
+
+export function trackBullseye(
+  image: PixelImage,
+  previousImage: PixelImage,
+  previousCorners: FrameCorners,
+  previousFinderCorners: FrameCorners,
+): BullseyeTrack | null {
+  if (image.width !== previousImage.width || image.height !== previousImage.height) return null;
+  const template: number[] = [];
+  const templatePoints: Array<[number, number]> = [];
+  for (let row = 0; row < 16; row += 1) {
+    for (let column = 0; column < 16; column += 1) {
+      const u = (column + 0.5) / 16;
+      const v = (row + 0.5) / 16;
+      template.push(sampleLuminance(previousImage, interpolateCorners(previousFinderCorners, u, v)));
+      templatePoints.push([u, v]);
+    }
+  }
+  const templateMean = template.reduce((sum, value) => sum + value, 0) / template.length;
+  const templateEnergy = template.reduce((sum, value) => sum + (value - templateMean) ** 2, 0);
+  if (templateEnergy < 1) return null;
+  const allSamples = templatePoints.map((_, index) => index);
+  const coarseSamples = templatePoints
+    .map((_, index) => index)
+    .filter((index) => Math.floor(index / 16) % 2 === 0 && index % 2 === 0);
+  const sampleStats = [coarseSamples, allSamples].map((indexes) => {
+    const mean = indexes.reduce((sum, index) => sum + template[index], 0) / indexes.length;
+    const energy = indexes.reduce((sum, index) => sum + (template[index] - mean) ** 2, 0);
+    return { indexes, mean, energy };
+  });
+
+  const anchor = interpolateCorners(previousFinderCorners, 0.5, 0.5);
+  const anchorCorners = previousFinderCorners.map((point) => ({
+    x: point.x - anchor.x,
+    y: point.y - anchor.y,
+  })) as FrameCorners;
+  const maxShift = Math.max(12, Math.round(Math.min(image.width, image.height) * 0.25));
+  const coarseOffsets: number[] = [];
+  for (let offset = -maxShift; offset <= maxShift; offset += 8) coarseOffsets.push(offset);
+  const coarseScales = [0.8, 1, 1.2];
+  const coarseAngles = [-10, 0, 10].map((degrees) => degrees * Math.PI / 180);
+  let best: { x: number; y: number; scale: number; angle: number; score: number } | null = null;
+
+  const scoreCandidate = (x: number, y: number, scale: number, angle: number, stats: typeof sampleStats[number]): number => {
+    const cosine = Math.cos(angle) * scale;
+    const sine = Math.sin(angle) * scale;
+    let valueSum = 0;
+    const values = new Array<number>(stats.indexes.length);
+    for (let sampleIndex = 0; sampleIndex < stats.indexes.length; sampleIndex += 1) {
+      const templateIndex = stats.indexes[sampleIndex];
+      const [u, v] = templatePoints[templateIndex];
+      const point = interpolateCorners(anchorCorners, u, v);
+      const value = sampleLuminance(image, {
+        x: anchor.x + x + cosine * point.x - sine * point.y,
+        y: anchor.y + y + sine * point.x + cosine * point.y,
+      });
+      values[sampleIndex] = value;
+      valueSum += value;
+    }
+    const mean = valueSum / values.length;
+    let covariance = 0;
+    let energy = 0;
+    for (let index = 0; index < values.length; index += 1) {
+      const centered = values[index] - mean;
+      covariance += centered * (template[stats.indexes[index]] - stats.mean);
+      energy += centered * centered;
+    }
+    return energy < 1 ? -1 : covariance / Math.sqrt(energy * stats.energy);
+  };
+
+  for (const y of coarseOffsets) {
+    for (const x of coarseOffsets) {
+      for (const scale of coarseScales) {
+        for (const angle of coarseAngles) {
+          const score = scoreCandidate(x, y, scale, angle, sampleStats[0]);
+          if (!best || score > best.score) best = { x, y, scale, angle, score };
+        }
+      }
+    }
+  }
+  if (!best || best.score < 0.55) return null;
+
+  best.score = scoreCandidate(best.x, best.y, best.scale, best.angle, sampleStats[1]);
+  const coarseBest = best;
+  for (let y = coarseBest.y - 5; y <= coarseBest.y + 5; y += 1) {
+    for (let x = coarseBest.x - 5; x <= coarseBest.x + 5; x += 1) {
+      const scales = new Set([1, coarseBest.scale * 0.96, coarseBest.scale * 1.04]);
+      const angles = new Set([0, coarseBest.angle - 5 * Math.PI / 180, coarseBest.angle + 5 * Math.PI / 180]);
+      for (const scale of scales) {
+        for (const angle of angles) {
+          const score = scoreCandidate(x, y, scale, angle, sampleStats[1]);
+          if (score > best.score) best = { x, y, scale, angle, score };
+        }
+      }
+    }
+  }
+  if (best.score < 0.7) return null;
+
+  const cosine = Math.cos(best.angle) * best.scale;
+  const sine = Math.sin(best.angle) * best.scale;
+  const transform = (point: FramePoint): FramePoint => {
+    const relativeX = point.x - anchor.x;
+    const relativeY = point.y - anchor.y;
+    return {
+      x: anchor.x + best.x + cosine * relativeX - sine * relativeY,
+      y: anchor.y + best.y + sine * relativeX + cosine * relativeY,
+    };
+  };
+  return {
+    corners: previousCorners.map(transform) as FrameCorners,
+    finderCorners: previousFinderCorners.map(transform) as FrameCorners,
+    score: best.score,
+  };
+}
+
 interface FrameCandidate {
   corners: FrameCorners;
   boundaryOffset: number;
+}
+
+function cross(origin: FramePoint, first: FramePoint, second: FramePoint): number {
+  return (first.x - origin.x) * (second.y - origin.y) - (first.y - origin.y) * (second.x - origin.x);
+}
+
+function quadrilateralFromHull(points: FramePoint[]): FrameCorners | null {
+  const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+  const lower: FramePoint[] = [];
+  for (const point of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) lower.pop();
+    lower.push(point);
+  }
+  const upper: FramePoint[] = [];
+  for (let index = sorted.length - 1; index >= 0; index -= 1) {
+    const point = sorted[index];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) upper.pop();
+    upper.push(point);
+  }
+  const hull = [...lower.slice(0, -1), ...upper.slice(0, -1)];
+  if (hull.length < 4) return null;
+
+  let first = 0;
+  let opposite = 1;
+  let maximumDistance = 0;
+  for (let left = 0; left < hull.length; left += 1) {
+    for (let right = left + 1; right < hull.length; right += 1) {
+      const dx = hull[left].x - hull[right].x;
+      const dy = hull[left].y - hull[right].y;
+      const distance = dx * dx + dy * dy;
+      if (distance > maximumDistance) {
+        first = left;
+        opposite = right;
+        maximumDistance = distance;
+      }
+    }
+  }
+  if (maximumDistance === 0) return null;
+
+  const start = hull[first];
+  const end = hull[opposite];
+  const lineLength = Math.sqrt(maximumDistance);
+  const farthestOnArc = (from: number, to: number, direction: 1 | -1): number => {
+    let bestIndex = -1;
+    let bestDistance = 0;
+    for (let index = (from + direction + hull.length) % hull.length; index !== to; index = (index + direction + hull.length) % hull.length) {
+      const distance = Math.abs(cross(start, end, hull[index])) / lineLength;
+      if (distance > bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    return bestIndex;
+  };
+  const firstArc = farthestOnArc(first, opposite, 1);
+  const secondArc = farthestOnArc(opposite, first, 1);
+  if (firstArc < 0 || secondArc < 0) return null;
+  return [start, hull[firstArc], end, hull[secondArc]];
 }
 
 function findMaskComponents(image: PixelImage, mask: Uint8Array, step: number, boundaryOffset: number): Array<FrameCandidate & { score: number }> {
@@ -97,6 +296,7 @@ function findMaskComponents(image: PixelImage, mask: Uint8Array, step: number, b
     let topRight: FramePoint | null = null;
     let bottomRight: FramePoint | null = null;
     let bottomLeft: FramePoint | null = null;
+    const componentPoints: FramePoint[] = [];
     while (head < tail) {
       const current = queue[head++];
       const x = current % columns;
@@ -107,6 +307,7 @@ function findMaskComponents(image: PixelImage, mask: Uint8Array, step: number, b
       minY = Math.min(minY, y);
       maxY = Math.max(maxY, y);
       const point = { x: Math.min(image.width - 1, x * step), y: Math.min(image.height - 1, y * step) };
+      componentPoints.push(point);
       const sum = x + y;
       const difference = x - y;
       if (sum < minSum) { minSum = sum; topLeft = point; }
@@ -142,9 +343,17 @@ function findMaskComponents(image: PixelImage, mask: Uint8Array, step: number, b
     if (Math.min(width, height) < Math.min(image.width, image.height) * 0.02 ||
       areaRatio < 0.005 || areaRatio > 0.98 ||
       aspectRatio < 0.2 || aspectRatio > 5) continue;
+    let corners: FrameCorners = [topLeft, topRight, bottomRight, bottomLeft];
+    const minimumEdge = Math.min(...corners.map((point, index) => {
+      const next = corners[(index + 1) % corners.length];
+      return Math.hypot(point.x - next.x, point.y - next.y);
+    }));
+    if (minimumEdge < Math.min(image.width, image.height) * 0.12) {
+      corners = quadrilateralFromHull(componentPoints) ?? corners;
+    }
     const density = count / Math.max(1, width * height / (step * step));
     candidates.push({
-      corners: [topLeft, topRight, bottomRight, bottomLeft],
+      corners,
       boundaryOffset,
       score: areaRatio * (1 - Math.min(1, density)),
     });
@@ -546,12 +755,23 @@ export function decodeOpticalFrameDetailed(
   trackedLocator = false,
 ): DecoderTrace {
   const layout = createAztecLayout(targetMatrixSize);
+  const legacyLayout = createAztecLayout(targetMatrixSize, '#000000', LEGACY_PERIMETER_WIDTH);
   let trackedTrace: DecoderTrace | null = null;
   if (trackedCorners) {
-    trackedTrace = decodeCandidate(image, layout, trackedCorners, trackedLocator ? 1 : 0);
+    trackedTrace = decodeCandidate(image, trackedLocator ? layout : legacyLayout, trackedCorners, trackedLocator ? 1 : 0);
     trackedTrace.trackedCandidate = true;
     trackedTrace.candidateCount = 0;
     if (trackedTrace.status === 'packet-decoded') return trackedTrace;
+    if (trackedLocator) {
+      const legacyTrace = decodeCandidate(image, legacyLayout, trackedCorners, 1);
+      legacyTrace.trackedCandidate = true;
+      legacyTrace.candidateCount = 0;
+      if (legacyTrace.status === 'packet-decoded') return legacyTrace;
+      if (legacyTrace.geometryCandidates > trackedTrace.geometryCandidates ||
+        (legacyTrace.orientationFound && !trackedTrace.orientationFound) ||
+        (legacyTrace.gridSampled && !trackedTrace.gridSampled) ||
+        legacyTrace.recognizedModules > trackedTrace.recognizedModules) trackedTrace = legacyTrace;
+    }
   }
   const detectedCandidates = findFrameCandidates(image);
   const candidates = detectedCandidates.map((candidate) => ({ ...candidate, tracked: false }));
@@ -588,17 +808,20 @@ export function decodeOpticalFrameDetailed(
   const candidateCount = detectedCandidates.length;
   let best: DecoderTrace | null = trackedTrace;
   for (const candidate of candidates) {
-    for (const corners of candidateOrientations(candidate.corners)) {
-      const trace = decodeCandidate(image, layout, corners, candidate.boundaryOffset);
-      trace.candidateCount = candidateCount;
-      trace.trackedCandidate = candidate.tracked;
-      if (!best || trace.geometryCandidates > best.geometryCandidates ||
-        (trace.orientationFound && !best.orientationFound) ||
-        (trace.gridSampled && !best.gridSampled) ||
-        trace.recognizedModules > best.recognizedModules) {
-        best = trace;
+    const candidateLayouts = candidate.boundaryOffset > 0 ? [layout, legacyLayout] : [legacyLayout];
+    for (const candidateLayout of candidateLayouts) {
+      for (const corners of candidateOrientations(candidate.corners)) {
+        const trace = decodeCandidate(image, candidateLayout, corners, candidate.boundaryOffset);
+        trace.candidateCount = candidateCount;
+        trace.trackedCandidate = candidate.tracked;
+        if (!best || trace.geometryCandidates > best.geometryCandidates ||
+          (trace.orientationFound && !best.orientationFound) ||
+          (trace.gridSampled && !best.gridSampled) ||
+          trace.recognizedModules > best.recognizedModules) {
+          best = trace;
+        }
+        if (trace.status === 'packet-decoded') return trace;
       }
-      if (trace.status === 'packet-decoded') return trace;
     }
   }
   if (best) return best;

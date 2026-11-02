@@ -1,59 +1,41 @@
-import { createAztecLayout, drawAztecFrame, MAX_FILE_BYTES, prepareAztecTransfer, readU16, readU32 } from './aztec';
+import { Capacitor } from '@capacitor/core';
+import { Directory, Filesystem } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
+import { drawAztecFrame, MAX_FILE_BYTES, prepareAztecTransfer } from './aztec';
 import type { PreparedAztecTransfer } from './aztec';
 import type { DecoderTrace } from './image-decoder';
 import type { WorkerRequest, WorkerResponse } from './worker-protocol';
-import type { WorkerDiagnostics } from './worker-protocol';
 
+const MATRIX_SIZE = 32;
+const SCAN_MAX_SIDE = 360;
+const SCAN_FRAME_QUEUE_LIMIT = 4;
+const SCAN_CAPTURE_INTERVAL = 1000 / 60;
 const fileInput = document.getElementById('fileInput') as HTMLInputElement;
 const sendButton = document.getElementById('sendButton') as HTMLButtonElement;
 const fileName = document.getElementById('sendFileName') as HTMLElement;
 const sendStatus = document.getElementById('sendStatus') as HTMLElement;
-const frameCount = document.getElementById('frameCount') as HTMLElement;
+const sendFileDetails = document.getElementById('sendFileDetails') as HTMLElement;
 const canvas = document.getElementById('tx') as HTMLCanvasElement;
 const camera = document.getElementById('camera') as HTMLVideoElement;
-const cameraPreview = document.getElementById('cameraPreview') as HTMLElement;
-const diagnosticOverlay = document.getElementById('diagnosticOverlay') as HTMLCanvasElement;
-const previewStatus = document.getElementById('previewStatus') as HTMLElement;
 const cameraCanvas = document.getElementById('scanCanvas') as HTMLCanvasElement;
 const startButton = document.getElementById('startButton') as HTMLButtonElement;
 const receiveStatus = document.getElementById('receiveStatus') as HTMLElement;
-const receiveProgress = document.getElementById('receiveProgress') as HTMLElement;
+const receiveProgress = document.getElementById('receiveProgress') as HTMLProgressElement;
+const receiveProgressText = document.getElementById('receiveProgressText') as HTMLElement;
 const receiveFileName = document.getElementById('receiveFileName') as HTMLElement;
+const cameraOverlay = document.querySelector<SVGSVGElement>('#cameraOverlay')!;
+const cameraOutline = document.querySelector<SVGPolygonElement>('#cameraOutline')!;
+const cameraBullseye = document.querySelector<SVGPolygonElement>('#cameraBullseye')!;
+const cameraReadoutState = document.getElementById('cameraReadoutState') as HTMLElement;
+const cameraReadoutCounts = document.getElementById('cameraReadoutCounts') as HTMLElement;
 const transferComplete = document.getElementById('transferComplete') as HTMLElement;
+const exportFileButton = document.getElementById('exportFileButton') as HTMLButtonElement;
 const sendPanel = document.getElementById('sendPanel') as HTMLElement;
 const receivePanel = document.getElementById('receivePanel') as HTMLElement;
 const sendTab = document.getElementById('sendTab') as HTMLButtonElement;
 const receiveTab = document.getElementById('receiveTab') as HTMLButtonElement;
-const targetMatrixInput = document.getElementById('targetMatrixSize') as HTMLSelectElement;
-const transmitTelemetry = document.getElementById('transmitTelemetry') as HTMLElement;
 const zoomSlider = document.getElementById('zoomSlider') as HTMLInputElement;
 const zoomHelp = document.getElementById('zoomHelp') as HTMLElement;
-const decoderTestButton = document.getElementById('decoderTestButton') as HTMLButtonElement;
-const savedFrameInput = document.getElementById('savedFrameInput') as HTMLInputElement;
-const decoderTestStatus = document.getElementById('decoderTestStatus') as HTMLElement;
-const diagnosticElements = {
-  camera: document.getElementById('diagCamera') as HTMLElement,
-  frames: document.getElementById('diagFrames') as HTMLElement,
-  processing: document.getElementById('diagProcessing') as HTMLElement,
-  candidates: document.getElementById('diagCandidates') as HTMLElement,
-  locator: document.getElementById('diagLocator') as HTMLElement,
-  tracking: document.getElementById('diagTracking') as HTMLElement,
-  geometry: document.getElementById('diagGeometry') as HTMLElement,
-  confidence: document.getElementById('diagConfidence') as HTMLElement,
-  finder: document.getElementById('diagFinder') as HTMLElement,
-  orientation: document.getElementById('diagOrientation') as HTMLElement,
-  grid: document.getElementById('diagGrid') as HTMLElement,
-  colour: document.getElementById('diagColour') as HTMLElement,
-  header: document.getElementById('diagHeader') as HTMLElement,
-  crc: document.getElementById('diagCrc') as HTMLElement,
-  packets: document.getElementById('diagPackets') as HTMLElement,
-  reconstruction: document.getElementById('diagReconstruction') as HTMLElement,
-  verification: document.getElementById('diagVerification') as HTMLElement,
-  lastDetection: document.getElementById('diagLastDetection') as HTMLElement,
-  lastPacket: document.getElementById('diagLastPacket') as HTMLElement,
-  rejected: document.getElementById('diagRejected') as HTMLElement,
-  latestError: document.getElementById('diagLatestError') as HTMLElement,
-};
 
 let transfer: PreparedAztecTransfer | null = null;
 let prepareGeneration = 0;
@@ -61,21 +43,29 @@ let sending = false;
 let stream: MediaStream | null = null;
 let worker: Worker | null = null;
 let scanTimer = 0;
+let videoFrameCallback = 0;
 let frameInFlight = false;
-let frameSentAt = 0;
-let receivedPacketsCount = 0;
-let isTransferComplete = false;
+const queuedScanFrames: ImageData[] = [];
+let lastScanCaptureTime = 0;
 let activeZoomTrack: MediaStreamTrack | null = null;
 let receiverGeneration = 0;
 let senderGeneration = 0;
-let cameraFramesReceived = 0;
-let lastRenderTimestamp = 0;
-let renderFps = 0;
-let latestTrace: Omit<DecoderTrace, 'packet'> | null = null;
-let latestDiagnostics: WorkerDiagnostics | null = null;
+let verifiedReceivedFile: { bytes: Uint8Array; name: string; mime: string } | null = null;
 
 type ZoomCapabilities = MediaTrackCapabilities & { zoom?: { min: number; max: number; step?: number } };
 type ZoomConstraints = MediaTrackConstraints & { advanced?: Array<MediaTrackConstraintSet & { zoom?: number }> };
+
+function formatFileSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = size / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
+}
 
 function stopSender(): void {
   if (sending) {
@@ -95,7 +85,6 @@ function setMode(mode: 'send' | 'receive'): void {
   receiveTab.classList.toggle('active', receiving);
   sendTab.setAttribute('aria-selected', String(!receiving));
   receiveTab.setAttribute('aria-selected', String(receiving));
-  targetMatrixInput.disabled = receiving || sending;
   if (receiving) {
     stopSender();
   } else {
@@ -109,7 +98,7 @@ function setCameraZoomAvailability(): void {
   const zoom = (track?.getCapabilities() as ZoomCapabilities | undefined)?.zoom;
   if (!zoom) {
     zoomSlider.disabled = true;
-    zoomHelp.textContent = 'Zoom is not supported by this camera; move the devices closer or farther apart.';
+    zoomHelp.textContent = 'Move closer to the screen if the image is hard to read.';
     return;
   }
   zoomSlider.min = String(zoom.min);
@@ -117,7 +106,7 @@ function setCameraZoomAvailability(): void {
   zoomSlider.step = String(zoom.step ?? 0.1);
   zoomSlider.value = String(zoom.min);
   zoomSlider.disabled = false;
-  zoomHelp.textContent = `Camera zoom available (${zoom.min}×–${zoom.max}×).`;
+  zoomHelp.textContent = 'Use the zoom control if needed.';
 }
 
 async function applyCameraZoom(): Promise<void> {
@@ -126,227 +115,159 @@ async function applyCameraZoom(): Promise<void> {
     const constraints: ZoomConstraints = { advanced: [{ zoom: Number(zoomSlider.value) }] };
     await activeZoomTrack.applyConstraints(constraints);
   } catch (error) {
+    console.error('Could not adjust the camera zoom.', error);
     zoomSlider.disabled = true;
-    zoomHelp.textContent = error instanceof Error ? `Camera zoom unavailable: ${error.message}` : 'Camera zoom could not be applied.';
+    zoomHelp.textContent = 'Move closer to the screen if the image is hard to read.';
   }
 }
 
-function statusForTrace(trace: Omit<DecoderTrace, 'packet'>, counts = latestDiagnostics): string {
-  if (counts?.verification === 'VERIFIED') return 'COMPLETE';
-  if (trace.status === 'packet-decoded') return counts?.uniqueBlocks
-    ? 'RECONSTRUCTING'
-    : 'PACKET ACCEPTED';
-  if (trace.status === 'candidate-not-found') return latestDiagnostics?.frames ? 'DETECTING' : 'WAITING';
-  if (trace.status === 'geometry-failed') return 'GEOMETRY FAILED';
-  if (trace.status === 'orientation-failed') return 'CANDIDATE FOUND — ORIENTATION FAILED';
-  if (trace.status === 'grid-sampling-failed') return 'GRID SAMPLING FAILED';
-  if (trace.status === 'colour-recognition-failed') return 'COLOUR RECOGNITION FAILED';
-  if (trace.status === 'crc-failed') return 'CRC FAILED';
-  return 'INVALID PACKET';
-}
-
-function updateDiagnostics(trace: Omit<DecoderTrace, 'packet'>, counts: WorkerDiagnostics): void {
-  latestTrace = trace;
-  latestDiagnostics = counts;
-  const status = statusForTrace(trace);
-  diagnosticElements.camera.textContent = stream?.active ? 'CONNECTED' : 'DISCONNECTED';
-  diagnosticElements.frames.textContent = `${cameraFramesReceived} received`;
-  diagnosticElements.processing.textContent = `${counts.frames} processed (${trace.imageWidth}×${trace.imageHeight})`;
-  diagnosticElements.candidates.textContent = `${counts.candidatesDetected} total; ${trace.candidateCount} this frame`;
-  diagnosticElements.locator.textContent = trace.locatorDetected ? 'ORANGE MARKER FOUND' : trace.corners ? 'DARK FRAME FALLBACK' : 'SEARCHING';
-  diagnosticElements.tracking.textContent = counts.trackingState;
-  diagnosticElements.geometry.textContent = trace.geometryCandidates
-    ? `ACCEPTED (${trace.geometryCandidates} this frame; ${counts.validGeometry} total)`
-    : trace.candidateCount ? `FAILED — ${trace.reason}` : 'WAITING';
-  diagnosticElements.confidence.textContent = trace.candidateConfidence === null
-    ? 'Not measured'
-    : `${trace.candidateConfidence.toFixed(1)}% structural match`;
-  diagnosticElements.finder.textContent = trace.finderCenter
-    ? `center (${trace.finderCenter.x.toFixed(1)}, ${trace.finderCenter.y.toFixed(1)}); ${trace.finderSizeModules} modules`
-    : 'Not located';
-  diagnosticElements.orientation.textContent = trace.orientationFound
-    ? `FOUND (${counts.orientationsFound} frames)`
-    : trace.candidateCount ? 'NOT FOUND' : 'WAITING';
-  diagnosticElements.grid.textContent = trace.gridSampled
-    ? `SAMPLED (${counts.gridsSampled} frames)`
-    : trace.orientationFound ? 'FAILED' : 'WAITING';
-  diagnosticElements.colour.textContent = trace.gridSampled
-    ? `${trace.recognizedModules}/${trace.totalModules} modules; confidence margin ${trace.colourConfidence?.toFixed(1) ?? '—'} ΔE`
-    : trace.orientationFound ? 'FAILED' : 'WAITING';
-  diagnosticElements.header.textContent = trace.headerValid === null ? 'WAITING' : trace.headerValid ? 'VALID' : 'INVALID';
-  diagnosticElements.crc.textContent = trace.crcValid === null ? 'WAITING' : trace.crcValid ? `PASSED (${counts.crcPasses})` : 'FAILED';
-  diagnosticElements.packets.textContent = `${counts.packets} accepted`;
-  diagnosticElements.reconstruction.textContent = `${counts.uniqueBlocks} unique blocks`;
-  diagnosticElements.verification.textContent = counts.verification;
-  diagnosticElements.lastDetection.textContent = counts.lastDetectionTimestamp
-    ? new Date(counts.lastDetectionTimestamp).toLocaleTimeString()
-    : 'Never';
-  diagnosticElements.lastPacket.textContent = counts.lastPacketId === null ? '—' : String(counts.lastPacketId);
-  diagnosticElements.rejected.textContent = `${counts.rejectedCandidates} / ${counts.rejectedPackets}`;
-  diagnosticElements.latestError.textContent = `Most recent error: ${counts.latestError ?? 'none'}`;
-  previewStatus.textContent = `${status} · ${trace.reason}`;
-  receiveStatus.textContent = status;
-  drawDiagnosticOverlay(trace);
-}
-
-function drawDiagnosticOverlay(trace: Omit<DecoderTrace, 'packet'>): void {
-  const context = diagnosticOverlay.getContext('2d');
-  if (!context) return;
-  const bounds = cameraPreview.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const width = Math.max(1, Math.round(bounds.width * dpr));
-  const height = Math.max(1, Math.round(bounds.height * dpr));
-  if (diagnosticOverlay.width !== width || diagnosticOverlay.height !== height) {
-    diagnosticOverlay.width = width;
-    diagnosticOverlay.height = height;
+function updateScanStatus(trace: Omit<DecoderTrace, 'packet'>): void {
+  updateCameraOverlay(trace);
+  cameraReadoutState.textContent = trace.status === 'packet-decoded'
+    ? 'FRAME READ'
+    : trace.candidateCount > 0 || trace.trackedCandidate || trace.geometryCandidates > 0
+      ? 'QR DETECTED'
+      : 'SEARCHING';
+  if (trace.status === 'packet-decoded') {
+    setReceiveStatus('Colorful code found—receiving file.', 'receiving');
+  } else if (trace.gridSampled) {
+    setReceiveStatus('Colorful code found—reading data. Keep both screens steady.', 'detected');
+  } else if (trace.orientationFound) {
+    setReceiveStatus('Colorful code found—hold the image steady.', 'detected');
+  } else if (trace.geometryCandidates > 0) {
+    setReceiveStatus('Code spotted—hold it steady while I line it up.', 'detected');
+  } else if (trace.candidateCount > 0) {
+    setReceiveStatus('Possible code spotted—move closer and hold steady.', 'detected');
+  } else if (trace.trackedCandidate) {
+    setReceiveStatus('Still looking at the code—hold steady and keep the whole image in view.', 'detected');
+  } else {
+    setReceiveStatus('Looking for the colorful code…', 'searching');
   }
-  context.setTransform(dpr, 0, 0, dpr, 0, 0);
-  context.clearRect(0, 0, bounds.width, bounds.height);
-  const videoBounds = camera.getBoundingClientRect();
-  if (!camera.videoWidth || !camera.videoHeight || videoBounds.width === 0 || videoBounds.height === 0) {
-    if (trace.status === 'candidate-not-found') {
-      context.strokeStyle = '#ffcc00';
-      context.setLineDash([8, 5]);
-      context.strokeRect(bounds.width * 0.15, bounds.height * 0.15, bounds.width * 0.7, bounds.height * 0.7);
-      context.setLineDash([]);
-    }
+}
+
+function updateCameraOverlay(trace: Omit<DecoderTrace, 'packet'>): void {
+  const width = camera.videoWidth;
+  const height = camera.videoHeight;
+  if (!width || !height) {
+    cameraOutline.setAttribute('visibility', 'hidden');
+    cameraBullseye.setAttribute('visibility', 'hidden');
     return;
   }
-  const scale = Math.min(videoBounds.width / camera.videoWidth, videoBounds.height / camera.videoHeight);
-  const contentWidth = camera.videoWidth * scale;
-  const contentHeight = camera.videoHeight * scale;
-  const contentLeft = videoBounds.left - bounds.left + (videoBounds.width - contentWidth) / 2;
-  const contentTop = videoBounds.top - bounds.top + (videoBounds.height - contentHeight) / 2;
-  const cropX = (camera.videoWidth - trace.imageWidth) / 2;
-  const cropY = (camera.videoHeight - trace.imageHeight) / 2;
-  const mapPoint = (point: { x: number; y: number }) => ({
-    x: contentLeft + (cropX + point.x) * scale,
-    y: contentTop + (cropY + point.y) * scale,
-  });
-  if (!trace.corners) {
-    if (trace.status === 'candidate-not-found') {
-      const side = Math.min(contentWidth, contentHeight) * 0.7;
-      context.strokeStyle = '#ffcc00';
-      context.setLineDash([8, 5]);
-      context.strokeRect(contentLeft + (contentWidth - side) / 2, contentTop + (contentHeight - side) / 2, side, side);
-      context.setLineDash([]);
-    }
-    return;
-  }
-  const colour = trace.status === 'packet-decoded' ? '#00ff88'
-    : trace.geometryCandidates === 0 ? '#ff4d4d'
-      : trace.orientationFound ? '#ffae00' : '#ffe600';
-  context.strokeStyle = colour;
-  context.lineWidth = 2;
-  context.setLineDash(trace.geometryCandidates ? [] : [8, 5]);
-  context.beginPath();
-  trace.corners.forEach((corner, index) => {
-    const point = mapPoint(corner);
-    if (index === 0) context.moveTo(point.x, point.y);
-    else context.lineTo(point.x, point.y);
-  });
-  context.closePath();
-  context.stroke();
-  context.setLineDash([]);
-  for (const [from, to] of trace.gridLines) {
-    const start = mapPoint(from);
-    const end = mapPoint(to);
-    context.beginPath();
-    context.moveTo(start.x, start.y);
-    context.lineTo(end.x, end.y);
-    context.strokeStyle = `${colour}88`;
-    context.lineWidth = 0.7;
-    context.stroke();
+  cameraOverlay.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  const sourceSize = Math.min(width, height);
+  const cropX = Math.floor((width - sourceSize) / 2);
+  const cropY = Math.floor((height - sourceSize) / 2);
+  const scale = sourceSize / trace.imageWidth;
+  if (trace.corners) {
+    const points = trace.corners
+      .map((point) => `${point.x * scale + cropX},${point.y * scale + cropY}`)
+      .join(' ');
+    cameraOutline.setAttribute('points', points);
+    cameraOutline.setAttribute('visibility', 'visible');
+  } else {
+    cameraOutline.setAttribute('visibility', 'hidden');
   }
   if (trace.finderCorners) {
-    context.beginPath();
-    trace.finderCorners.forEach((corner, index) => {
-      const point = mapPoint(corner);
-      if (index === 0) context.moveTo(point.x, point.y);
-      else context.lineTo(point.x, point.y);
-    });
-    context.closePath();
-    context.strokeStyle = '#00e5ff';
-    context.lineWidth = 2;
-    context.stroke();
-    if (trace.finderCenter) {
-      const center = mapPoint(trace.finderCenter);
-      context.beginPath();
-      context.arc(center.x, center.y, 3, 0, Math.PI * 2);
-      context.fillStyle = '#00e5ff';
-      context.fill();
-    }
+    const points = trace.finderCorners
+      .map((point) => `${point.x * scale + cropX},${point.y * scale + cropY}`)
+      .join(' ');
+    cameraBullseye.setAttribute('points', points);
+    cameraBullseye.setAttribute('visibility', 'visible');
+  } else {
+    cameraBullseye.setAttribute('visibility', 'hidden');
   }
-  for (const corner of trace.corners) {
-    const point = mapPoint(corner);
-    context.beginPath();
-    context.arc(point.x, point.y, 4, 0, Math.PI * 2);
-    context.fillStyle = colour;
-    context.fill();
-  }
+  cameraOverlay.dataset.scanState = trace.status === 'packet-decoded'
+    ? 'receiving'
+    : trace.candidateCount > 0 || trace.trackedCandidate || trace.geometryCandidates > 0
+      ? 'detected'
+      : 'searching';
 }
 
-function updateTransmitTelemetry(
-  packet: Uint8Array,
-  currentFrame: number,
-  totalFrames: number,
-  render: ReturnType<typeof drawAztecFrame>,
-  state: 'RUNNING' | 'STOPPED',
-): void {
-  const frameId = packet.length >= 4 ? readU32(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), 0) : 0;
-  const degree = packet[20] ?? 0;
-  const firstBlockId = degree > 0 && packet.length >= 23
-    ? readU16(new DataView(packet.buffer, packet.byteOffset, packet.byteLength), 21)
-    : '—';
-  const now = performance.now();
-  if (lastRenderTimestamp > 0) {
-    const instantaneous = 1000 / Math.max(1, now - lastRenderTimestamp);
-    renderFps = renderFps === 0 ? instantaneous : renderFps * 0.75 + instantaneous * 0.25;
-  }
-  lastRenderTimestamp = now;
-  transmitTelemetry.textContent = `Frame ${currentFrame}/${totalFrames} | Packet ${frameId} / block ${firstBlockId} | ${renderFps.toFixed(1)} FPS | ${state} | Canvas ${render.width}×${render.height} | Matrix ${render.changedModules}/${render.totalModules} changed`;
+function updateReceiveProgress(qrCodesRead: number, recoveredBlocks: number, requiredBlocks: number): void {
+  receiveProgress.hidden = false;
+  receiveProgress.max = requiredBlocks;
+  receiveProgress.value = recoveredBlocks;
+  receiveProgressText.textContent = `Unique QR codes read: ${qrCodesRead}. Data blocks recovered: ${recoveredBlocks} of ${requiredBlocks}.`;
+  cameraReadoutCounts.textContent = `QR ${qrCodesRead} · DATA ${recoveredBlocks}/${requiredBlocks}`;
 }
 
-function scan(): void {
+function setReceiveStatus(text: string, scanState?: 'searching' | 'detected' | 'receiving'): void {
+  receiveStatus.textContent = text;
+  if (scanState) receiveStatus.dataset.scanState = scanState;
+  else delete receiveStatus.dataset.scanState;
+}
+
+function scheduleScan(): void {
   if (!stream || !worker) return;
-  if (camera.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || camera.videoWidth === 0 || camera.videoHeight === 0 || frameInFlight) {
+  if ('requestVideoFrameCallback' in camera) {
+    videoFrameCallback = camera.requestVideoFrameCallback(() => {
+      videoFrameCallback = 0;
+      scan();
+    });
+  } else {
     scanTimer = requestAnimationFrame(scan);
-    return;
   }
-  if (cameraCanvas.width !== camera.videoWidth || cameraCanvas.height !== camera.videoHeight) {
-    cameraCanvas.width = camera.videoWidth;
-    cameraCanvas.height = camera.videoHeight;
-  }
-  const context = cameraCanvas.getContext('2d', { willReadFrequently: true });
-  if (!context) {
-    receiveStatus.textContent = 'Camera capture is unavailable in this browser.';
-    stopReceiver();
-    return;
-  }
-  context.drawImage(camera, 0, 0);
-  const sourceSize = Math.min(cameraCanvas.width, cameraCanvas.height);
-  const cropX = Math.floor((cameraCanvas.width - sourceSize) / 2);
-  const cropY = Math.floor((cameraCanvas.height - sourceSize) / 2);
+}
+
+function processNextScanFrame(): void {
+  if (!stream || !worker || frameInFlight || queuedScanFrames.length === 0) return;
+  const image = queuedScanFrames.shift();
+  if (!image) return;
+  frameInFlight = true;
   try {
-    const image = context.getImageData(cropX, cropY, sourceSize, sourceSize);
-    cameraFramesReceived += 1;
-    diagnosticElements.frames.textContent = `${cameraFramesReceived} received`;
-    frameInFlight = true;
-    frameSentAt = performance.now();
     const request: WorkerRequest = { type: 'frame', pixels: image };
     worker.postMessage(request, [image.data.buffer]);
   } catch (error) {
-    receiveStatus.textContent = error instanceof Error ? `Camera frame capture failed: ${error.message}` : 'Camera frame capture failed.';
+    console.error('Could not send the camera image to the decoder.', error);
+    setReceiveStatus('Could not process the camera image. Please try again.');
+    stopReceiver();
+  }
+}
+
+function scan(timestamp?: number): void {
+  if (!stream || !worker) return;
+  scheduleScan();
+  if (timestamp !== undefined) {
+    if (timestamp - lastScanCaptureTime < SCAN_CAPTURE_INTERVAL) return;
+    lastScanCaptureTime = timestamp;
+  }
+  if (camera.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || camera.videoWidth === 0 || camera.videoHeight === 0) return;
+  const sourceSize = Math.min(camera.videoWidth, camera.videoHeight);
+  const scanSize = Math.min(sourceSize, SCAN_MAX_SIDE);
+  if (cameraCanvas.width !== scanSize || cameraCanvas.height !== scanSize) {
+    cameraCanvas.width = scanSize;
+    cameraCanvas.height = scanSize;
+  }
+  const context = cameraCanvas.getContext('2d', { willReadFrequently: true });
+  if (!context) {
+    setReceiveStatus('Camera preview is unavailable.');
     stopReceiver();
     return;
   }
-  scanTimer = requestAnimationFrame(scan);
+  const cropX = Math.floor((camera.videoWidth - sourceSize) / 2);
+  const cropY = Math.floor((camera.videoHeight - sourceSize) / 2);
+  try {
+    context.drawImage(camera, cropX, cropY, sourceSize, sourceSize, 0, 0, scanSize, scanSize);
+    const image = context.getImageData(0, 0, scanSize, scanSize);
+    if (queuedScanFrames.length === SCAN_FRAME_QUEUE_LIMIT) queuedScanFrames.shift();
+    queuedScanFrames.push(image);
+    processNextScanFrame();
+  } catch (error) {
+    console.error('Could not read the camera image.', error);
+    setReceiveStatus('Could not read the camera image. Please try again.');
+    stopReceiver();
+    return;
+  }
 }
 
 function stopReceiver(): void {
   receiverGeneration += 1;
   if (scanTimer) cancelAnimationFrame(scanTimer);
+  if (videoFrameCallback) camera.cancelVideoFrameCallback(videoFrameCallback);
   scanTimer = 0;
+  videoFrameCallback = 0;
+  queuedScanFrames.length = 0;
+  lastScanCaptureTime = 0;
   worker?.postMessage({ type: 'stop' } satisfies WorkerRequest);
   worker?.terminate();
   worker = null;
@@ -356,184 +277,193 @@ function stopReceiver(): void {
   activeZoomTrack = null;
   zoomSlider.disabled = true;
   frameInFlight = false;
+  cameraOutline.setAttribute('visibility', 'hidden');
+  cameraBullseye.setAttribute('visibility', 'hidden');
+  cameraReadoutState.textContent = 'SEARCHING';
+  cameraReadoutCounts.textContent = 'QR 0 · DATA 0/—';
+  cameraOverlay.dataset.scanState = 'searching';
   startButton.textContent = 'Start camera';
-  targetMatrixInput.disabled = false;
-  diagnosticElements.camera.textContent = 'DISCONNECTED';
-  previewStatus.textContent = 'WAITING — camera off';
-  const overlayContext = diagnosticOverlay.getContext('2d');
-  overlayContext?.clearRect(0, 0, diagnosticOverlay.width, diagnosticOverlay.height);
 }
 
 function resetReceiveState(): void {
-  receivedPacketsCount = 0;
-  isTransferComplete = false;
+  verifiedReceivedFile = null;
   frameInFlight = false;
-  cameraFramesReceived = 0;
-  latestTrace = null;
-  latestDiagnostics = null;
   transferComplete.hidden = true;
-  receiveProgress.textContent = '';
+  exportFileButton.hidden = true;
   receiveFileName.textContent = '';
-  diagnosticElements.camera.textContent = 'CONNECTED';
-  diagnosticElements.frames.textContent = '0 received';
-  diagnosticElements.processing.textContent = '0 processed';
-  diagnosticElements.candidates.textContent = '0 candidates';
-  diagnosticElements.locator.textContent = 'WAITING';
-  diagnosticElements.tracking.textContent = 'SEARCHING';
-  diagnosticElements.geometry.textContent = 'WAITING';
-  diagnosticElements.confidence.textContent = 'Not measured';
-  diagnosticElements.finder.textContent = 'Not located';
-  diagnosticElements.orientation.textContent = 'WAITING';
-  diagnosticElements.grid.textContent = 'WAITING';
-  diagnosticElements.colour.textContent = 'WAITING';
-  diagnosticElements.header.textContent = 'WAITING';
-  diagnosticElements.crc.textContent = 'WAITING';
-  diagnosticElements.packets.textContent = '0 accepted';
-  diagnosticElements.reconstruction.textContent = '0 blocks';
-  diagnosticElements.verification.textContent = 'WAITING';
-  diagnosticElements.lastDetection.textContent = 'Never';
-  diagnosticElements.lastPacket.textContent = '—';
-  diagnosticElements.rejected.textContent = '0 / 0';
-  diagnosticElements.latestError.textContent = 'Most recent error: none';
+  receiveProgress.hidden = true;
+  receiveProgress.value = 0;
+  receiveProgressText.textContent = 'Waiting to detect a QR code.';
+  cameraOutline.setAttribute('visibility', 'hidden');
+  cameraBullseye.setAttribute('visibility', 'hidden');
+  cameraReadoutState.textContent = 'SEARCHING';
+  cameraReadoutCounts.textContent = 'QR 0 · DATA 0/—';
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const chunkSize = 49_152;
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    chunks.push(btoa(String.fromCharCode(...bytes.subarray(offset, offset + chunkSize))));
+  }
+  return chunks.join('');
+}
+
+async function exportVerifiedFile(file: { bytes: Uint8Array; name: string; mime: string }): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const blobBytes = new Uint8Array(file.bytes.length);
+    blobBytes.set(file.bytes);
+    const url = URL.createObjectURL(new Blob([blobBytes.buffer], { type: file.mime }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = file.name;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setReceiveStatus('File received and downloaded.');
+    return;
+  }
+
+  exportFileButton.disabled = true;
+  let temporaryPath: string | null = null;
+  try {
+    const safeName = file.name
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+      .replace(/^\.+$/, '_') || 'received-file';
+    const filePath = `received-${Date.now()}-${safeName}`;
+    const savedFile = await Filesystem.writeFile({
+      path: filePath,
+      data: bytesToBase64(file.bytes),
+      directory: Directory.Cache,
+    });
+    temporaryPath = filePath;
+    await Share.share({
+      title: file.name,
+      files: [savedFile.uri],
+      dialogTitle: 'Save or share received file',
+    });
+    setReceiveStatus('File received. Choose where to save or share it.');
+  } catch (error) {
+    console.error('Could not export the received file.', error);
+    setReceiveStatus('File received, but it could not be saved. Tap the button to try again.');
+  } finally {
+    if (temporaryPath) {
+      try {
+        await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Cache });
+      } catch (error) {
+        console.error('Could not remove the temporary received file.', error);
+      }
+    }
+    exportFileButton.disabled = false;
+  }
 }
 
 function downloadCompletedFile(message: Extract<WorkerResponse, { type: 'complete' }>): void {
+  updateReceiveProgress(message.unique, message.solved, message.blockCount);
   if (!message.verified || !/^[\da-f]{64}$/i.test(message.expectedHash)) {
-    receiveStatus.textContent = 'Transfer integrity failure: the receiver did not verify the reconstructed file.';
+    setReceiveStatus('The file may not have arrived correctly. Please scan again.');
     stopReceiver();
     return;
   }
-  isTransferComplete = true;
-  const blob = new Blob([new Uint8Array(message.bytes)], { type: message.mime || 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = message.name || 'received-file';
-  link.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  receiveFileName.textContent = `${message.name || 'received-file'} (${message.bytes.byteLength.toLocaleString()} bytes, ${message.mime || 'application/octet-stream'})`;
+  verifiedReceivedFile = {
+    bytes: new Uint8Array(message.bytes),
+    name: message.name || 'received-file',
+    mime: message.mime || 'application/octet-stream',
+  };
+  receiveFileName.textContent = verifiedReceivedFile.name;
   transferComplete.hidden = false;
-  receiveStatus.textContent = 'Transfer complete; SHA-256 verified and file downloaded.';
-  receiveProgress.textContent = `${message.unique} unique packets; ${message.solved} source blocks recovered`;
+  exportFileButton.hidden = !Capacitor.isNativePlatform();
+  setReceiveStatus(Capacitor.isNativePlatform()
+    ? 'File received. Opening save and share options…'
+    : 'File received and downloaded.');
   stopReceiver();
+  void exportVerifiedFile(verifiedReceivedFile);
 }
 
 function handleWorkerMessage(message: WorkerResponse): void {
   if (message.type === 'packet') {
-    receivedPacketsCount = message.decodedCount;
     if (message.name) receiveFileName.textContent = message.name;
-    receiveProgress.textContent = `Accepted ${message.decodedCount} unique packets; recovered ${message.solved} of ${message.blockCount} source blocks`;
+    updateReceiveProgress(message.decodedCount, message.solved, message.blockCount);
+    cameraReadoutState.textContent = 'FRAME SAVED';
+    setReceiveStatus('Collecting QR frames. The file will be rebuilt as enough data arrives.', 'receiving');
     return;
   }
   if (message.type === 'diagnostic') {
-    updateDiagnostics(message.trace, message.counts);
+    updateScanStatus(message.trace);
     return;
   }
   if (message.type === 'frameDone') {
     frameInFlight = false;
-    if (message.counts.frames > 0) {
-      const elapsed = frameSentAt > 0 ? performance.now() - frameSentAt : 0;
-      const fps = elapsed > 0 ? (1000 / elapsed).toFixed(1) : '0.0';
-      if (latestTrace) {
-        diagnosticElements.processing.textContent = `${message.counts.frames} processed (${latestTrace.imageWidth}×${latestTrace.imageHeight}) · ${fps} FPS`;
-      }
-    }
+    processNextScanFrame();
     return;
   }
   if (message.type === 'complete') {
     downloadCompletedFile(message);
     return;
   }
-  receiveStatus.textContent = message.message;
+  console.error('The receiver could not finish this transfer.', message.message);
+  setReceiveStatus('Could not receive the file. Keep both screens steady and try again.');
   stopReceiver();
 }
 
-async function prepareSelectedFile(file: File, matrixSize: number): Promise<void> {
+async function prepareSelectedFile(file: File): Promise<void> {
   const generation = ++prepareGeneration;
   transfer = null;
   sendButton.disabled = true;
-  frameCount.textContent = '';
   fileName.textContent = file.name;
-  sendStatus.textContent = `Preparing ${matrixSize}×${matrixSize} transfer...`;
+  sendFileDetails.textContent = `${formatFileSize(file.size)} · Calculating QR count…`;
+  sendStatus.textContent = 'Preparing your file…';
   try {
-    if (file.size > MAX_FILE_BYTES) throw new Error(`Files larger than ${MAX_FILE_BYTES / (1024 * 1024)} MiB are not supported.`);
-    const prepared = await prepareAztecTransfer(file, matrixSize, (current, total) => {
-      if (generation === prepareGeneration) sendStatus.textContent = `Preparing source block ${current} of ${total}...`;
-    });
+    if (file.size > MAX_FILE_BYTES) throw new Error('This file is too large to send.');
+    const prepared = await prepareAztecTransfer(file, MATRIX_SIZE);
     if (generation !== prepareGeneration) return;
     transfer = prepared;
-    const layout = createAztecLayout(prepared.targetMatrixSize);
-    const compressionSummary = prepared.compressed
-      ? `; gzip ${prepared.totalBytes.toLocaleString()} → ${prepared.encodedBytes.toLocaleString()} bytes (${Math.round((1 - prepared.encodedBytes / prepared.totalBytes) * 100)}% smaller)`
-      : '';
-    frameCount.textContent = `${prepared.frameCount} frames; ${prepared.blockCount} source blocks; ${layout.dataCoordinates.length} data modules; ${layout.alignmentCoordinates.size} structural markers${compressionSummary}`;
-    sendStatus.textContent = 'Ready - press Send to stream continuously';
+    sendFileDetails.textContent = `${formatFileSize(file.size)} · ${prepared.frameCount} QR codes`;
+    sendStatus.textContent = 'Ready to send.';
     sendButton.disabled = false;
   } catch (error) {
     if (generation !== prepareGeneration) return;
-    sendStatus.textContent = error instanceof Error ? error.message : 'Could not prepare file.';
+    console.error('Could not prepare the selected file.', error);
+    sendFileDetails.textContent = `${formatFileSize(file.size)} · QR count unavailable`;
+    sendStatus.textContent = 'Could not prepare this file. Try a different file.';
   }
 }
 
 fileInput.onchange = () => {
   const file = fileInput.files?.[0];
-  if (file) void prepareSelectedFile(file, Number(targetMatrixInput.value));
-};
-
-targetMatrixInput.onchange = () => {
-  const file = fileInput.files?.[0];
-  if (file) {
-    void prepareSelectedFile(file, Number(targetMatrixInput.value));
-    return;
-  }
-  prepareGeneration += 1;
-  transfer = null;
-  sendButton.disabled = true;
-  frameCount.textContent = '';
-  sendStatus.textContent = 'Choose a file';
+  if (file) void prepareSelectedFile(file);
 };
 
 sendButton.onclick = async () => {
   if (sending) {
     stopSender();
-    transmitTelemetry.textContent = transmitTelemetry.textContent.replace('RUNNING', 'STOPPED');
+    sendStatus.textContent = 'Ready to send.';
     return;
   }
   if (!transfer) return;
-  const selectedMatrixSize = Number(targetMatrixInput.value);
-  if (transfer.targetMatrixSize !== selectedMatrixSize) {
-    const file = fileInput.files?.[0];
-    if (file) void prepareSelectedFile(file, selectedMatrixSize);
-    return;
-  }
   const activeTransfer = transfer;
   const generation = ++senderGeneration;
   sending = true;
-  renderFps = 0;
-  lastRenderTimestamp = 0;
   fileInput.disabled = true;
-  targetMatrixInput.disabled = true;
   sendButton.textContent = 'Stop';
   let index = 0;
   try {
     while (sending && generation === senderGeneration) {
       const packet = activeTransfer.packets[index];
-      const render = drawAztecFrame(packet, canvas, activeTransfer.targetMatrixSize);
-      updateTransmitTelemetry(packet, index + 1, activeTransfer.frameCount, render, 'RUNNING');
-      sendStatus.textContent = `Displaying frame ${index + 1} of ${activeTransfer.frameCount}; sequence repeats for loss recovery`;
+      drawAztecFrame(packet, canvas, activeTransfer.targetMatrixSize);
+      sendStatus.textContent = `Sending QR ${index + 1} of ${activeTransfer.frameCount}…`;
       index = (index + 1) % activeTransfer.packets.length;
-      const holdMs = Math.max(140, Math.round(140 * Math.pow(activeTransfer.targetMatrixSize / 63, 1.35)));
+      const holdMs = Math.max(220, Math.round(220 * Math.pow(activeTransfer.targetMatrixSize / 63, 1.35)));
       await new Promise<void>((resolve) => window.setTimeout(resolve, holdMs));
     }
   } catch (error) {
-    sendStatus.textContent = error instanceof Error ? error.message : 'Could not render the transfer frame.';
+    console.error('Could not display the transfer.', error);
+    sendStatus.textContent = 'Could not send this file. Please try again.';
   } finally {
     if (generation !== senderGeneration) return;
     sending = false;
     fileInput.disabled = false;
-    targetMatrixInput.disabled = !receivePanel.hidden;
     sendButton.textContent = 'Send';
-    if (sendStatus.textContent.startsWith('Displaying frame')) sendStatus.textContent = 'Stream stopped; prepared packets retained';
+    if (sendStatus.textContent.startsWith('Sending QR ')) sendStatus.textContent = 'Ready to send.';
   }
 };
 
@@ -541,102 +471,25 @@ canvas.addEventListener('click', () => {
   if (sending) stopSender();
 });
 
-function runWorkerDecodeTest(image: ImageData, matrixSize: number, label: string): Promise<void> {
-  decoderTestStatus.textContent = `${label}: starting actual decoder worker...`;
-  const testWorker = new Worker(new URL('./decoder.worker.ts', import.meta.url), { type: 'module' });
-  return new Promise<void>((resolve) => {
-    let finished = false;
-    let locatorDetected = false;
-    const finish = (message: string): void => {
-      if (finished) return;
-      finished = true;
-      window.clearTimeout(timeout);
-      testWorker.terminate();
-      decoderTestStatus.textContent = message;
-      resolve();
-    };
-    const timeout = window.setTimeout(() => finish(`${label}: timed out before the decoder completed.`), 20000);
-    testWorker.onmessage = (event: MessageEvent<WorkerResponse>) => {
-      const message = event.data;
-      if (message.type === 'diagnostic') {
-        const trace = message.trace;
-        locatorDetected = trace.locatorDetected;
-        decoderTestStatus.textContent = `${label}: ${statusForTrace(trace, message.counts)}; ${locatorDetected ? 'orange locator found' : 'dark-border fallback'}; geometry ${trace.geometryCandidates ? 'accepted' : 'failed'}; colours ${trace.recognizedModules}/${trace.totalModules}; header ${trace.headerValid ?? 'not reached'}; CRC ${trace.crcValid ?? 'not reached'}; ${trace.reason}`;
-      } else if (message.type === 'packet') {
-        decoderTestStatus.textContent = `${label}: packet ${message.frameId} accepted; recovered ${message.solved}/${message.blockCount} blocks.`;
-      } else if (message.type === 'complete') {
-        finish(`${label}: COMPLETE — ${locatorDetected ? 'orange locator found; ' : 'dark-border fallback used; '}geometry, colour decoding, CRC32 and SHA-256 verified; packet ${message.unique ? 'accepted' : 'decoded'}, ${message.solved} block(s) recovered.`);
-      } else if (message.type === 'error') {
-        finish(`${label}: FAILED — ${message.message}`);
-      }
-    };
-    testWorker.onerror = (event: ErrorEvent) => finish(`${label}: worker failed — ${event.message || 'unknown error'}`);
-    testWorker.postMessage({ type: 'start', targetMatrixSize: matrixSize } satisfies WorkerRequest);
-    testWorker.postMessage({ type: 'frame', pixels: image } satisfies WorkerRequest, [image.data.buffer]);
-  });
-}
-
-decoderTestButton.onclick = async () => {
-  decoderTestButton.disabled = true;
-  try {
-    const matrixSize = Number(targetMatrixInput.value);
-    const testBytes = new TextEncoder().encode('HCAC test');
-    const testFile = new File([testBytes], 'hcac-self-test.txt', { type: 'text/plain' });
-    const prepared = await prepareAztecTransfer(testFile, matrixSize);
-    const renderCanvas = document.createElement('canvas');
-    drawAztecFrame(prepared.packets[0], renderCanvas, matrixSize);
-    const context = renderCanvas.getContext('2d', { willReadFrequently: true });
-    if (!context) throw new Error('Could not render the self-test frame.');
-    await runWorkerDecodeTest(context.getImageData(0, 0, renderCanvas.width, renderCanvas.height), matrixSize, 'Generated-frame self-test');
-  } catch (error) {
-    decoderTestStatus.textContent = error instanceof Error ? `Self-test failed: ${error.message}` : 'Self-test failed.';
-  } finally {
-    decoderTestButton.disabled = false;
-  }
-};
-
-savedFrameInput.onchange = async () => {
-  const file = savedFrameInput.files?.[0];
-  if (!file) return;
-  try {
-    decoderTestStatus.textContent = `Loading saved image "${file.name}"...`;
-    const bitmap = await createImageBitmap(file);
-    try {
-      const scale = Math.min(1, 1600 / Math.max(bitmap.width, bitmap.height));
-      const imageCanvas = document.createElement('canvas');
-      imageCanvas.width = Math.max(1, Math.round(bitmap.width * scale));
-      imageCanvas.height = Math.max(1, Math.round(bitmap.height * scale));
-      const context = imageCanvas.getContext('2d', { willReadFrequently: true });
-      if (!context) throw new Error('Could not read the selected image.');
-      context.drawImage(bitmap, 0, 0, imageCanvas.width, imageCanvas.height);
-      const image = context.getImageData(0, 0, imageCanvas.width, imageCanvas.height);
-      await runWorkerDecodeTest(image, Number(targetMatrixInput.value), `Saved image "${file.name}"`);
-    } finally {
-      bitmap.close();
-    }
-  } catch (error) {
-    decoderTestStatus.textContent = error instanceof Error ? `Saved-image decode failed: ${error.message}` : 'Saved-image decode failed.';
-  }
-};
-
 startButton.onclick = async () => {
   if (stream) {
     stopReceiver();
-    receiveStatus.textContent = 'Camera stopped';
-    targetMatrixInput.disabled = false;
+    setReceiveStatus('Camera stopped.');
     return;
   }
   if (!navigator.mediaDevices?.getUserMedia) {
-    receiveStatus.textContent = 'Camera access is not available in this browser. Use a current mobile browser over HTTPS.';
+    setReceiveStatus('Camera access is unavailable. Try opening the app in a supported browser.');
     return;
   }
   const generation = ++receiverGeneration;
   startButton.disabled = true;
-  receiveStatus.textContent = 'Requesting camera permission...';
+  setReceiveStatus('Starting camera…');
   try {
-    const matrixSize = Number(targetMatrixInput.value);
     const acquiredStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      video: {
+        facingMode: { ideal: 'environment' },
+        frameRate: { ideal: 120 },
+      },
       audio: false,
     });
     if (generation !== receiverGeneration || receivePanel.hidden) {
@@ -650,21 +503,20 @@ startButton.onclick = async () => {
     worker = new Worker(new URL('./decoder.worker.ts', import.meta.url), { type: 'module' });
     worker.onmessage = (event: MessageEvent<WorkerResponse>) => handleWorkerMessage(event.data);
     worker.onerror = (event: ErrorEvent) => {
-      receiveStatus.textContent = `Receiver worker failed: ${event.message || 'unknown error'}`;
+      console.error('The receiver stopped unexpectedly.', event.message);
+      setReceiveStatus('The camera stopped unexpectedly. Please try again.');
       stopReceiver();
     };
     resetReceiveState();
     for (const track of acquiredStream.getVideoTracks()) {
       track.addEventListener('ended', () => {
-        diagnosticElements.camera.textContent = 'DISCONNECTED';
-        receiveStatus.textContent = 'Camera disconnected.';
+        setReceiveStatus('Camera stopped.');
       }, { once: true });
     }
-    targetMatrixInput.disabled = true;
     setCameraZoomAvailability();
-    receiveStatus.textContent = 'Camera active; center the entire colored frame in view.';
+    setReceiveStatus('Looking for the colorful code. Point the camera at the sender’s screen.', 'searching');
     startButton.textContent = 'Stop camera';
-    worker.postMessage({ type: 'start', targetMatrixSize: matrixSize } satisfies WorkerRequest);
+    worker.postMessage({ type: 'start', targetMatrixSize: MATRIX_SIZE } satisfies WorkerRequest);
     scan();
   } catch (error) {
     if (generation !== receiverGeneration) return;
@@ -673,18 +525,16 @@ startButton.onclick = async () => {
     worker?.terminate();
     worker = null;
     camera.srcObject = null;
-    targetMatrixInput.disabled = false;
+    console.error('Could not start the camera.', error);
     const errorName = error instanceof DOMException ? error.name : '';
     const hint = errorName === 'NotAllowedError'
-      ? 'Camera permission was denied. Allow camera access in browser settings.'
+      ? 'Allow camera access to scan a transfer.'
       : errorName === 'NotFoundError'
         ? 'No camera was found on this device.'
         : errorName === 'NotReadableError'
-          ? 'The camera is already in use by another application.'
-          : error instanceof Error
-            ? error.message
-            : 'Could not start the camera. HTTPS is required.';
-    receiveStatus.textContent = hint;
+          ? 'Close other apps using the camera and try again.'
+          : 'Could not start the camera. Please try again.';
+    setReceiveStatus(hint);
     startButton.textContent = 'Start camera';
   } finally {
     startButton.disabled = false;
@@ -692,6 +542,9 @@ startButton.onclick = async () => {
 };
 
 zoomSlider.oninput = () => { void applyCameraZoom(); };
+exportFileButton.onclick = () => {
+  if (verifiedReceivedFile) void exportVerifiedFile(verifiedReceivedFile);
+};
 sendTab.onclick = () => setMode('send');
 receiveTab.onclick = () => setMode('receive');
 window.addEventListener('beforeunload', () => {

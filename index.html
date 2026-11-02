@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Color Fountain Transfer</title>
+  <title>HCAC-OFT</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { margin: 0; min-height: 100vh; background: #000; color: #fff; }
@@ -14,26 +14,24 @@
     button:disabled { opacity: .45; cursor: not-allowed; }
     .tabs button { background: #252525; color: #fff; }
     .tabs button.active { background: #fff; color: #000; }
-    .protocols { display: flex; gap: 6px; justify-content: center; }
-    .protocols button { background: #252525; color: #fff; }
-    .protocols button.active { background: #fff; color: #000; }
     .panel { width: min(100%, 760px); display: grid; justify-items: center; gap: 10px; }
     .meta { min-height: 22px; text-align: center; }
-    .telemetry { color: #7fffd4; font-family: ui-monospace, monospace; font-size: .85rem; }
+    .subtle { color: #aaa; font-size: .9rem; }
+    h1 { margin: 0; font-size: 1.5rem; }
+    #receiveStatus[data-scan-state] { display: flex; align-items: center; justify-content: center; gap: 8px; }
+    #receiveStatus[data-scan-state]::before { width: 10px; height: 10px; border-radius: 50%; background: #e6b422; content: ""; flex: 0 0 10px; }
+    #receiveStatus[data-scan-state="detected"]::before { background: #43d17d; }
+    #receiveStatus[data-scan-state="receiving"]::before { background: #63a8ff; }
     #tx { display: block; width: min(92vw, 570px); height: min(92vw, 570px); max-width: 100%; background: #fff; image-rendering: pixelated; }
     #cameraPreview { position: relative; width: min(100%, 720px); background: #111; }
     #camera { display: block; width: 100%; max-height: 65vh; object-fit: contain; }
-    #diagnosticOverlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-    #previewStatus { position: absolute; left: 8px; top: 8px; padding: 4px 8px; background: #000c; color: #fff; font: 12px ui-monospace, monospace; pointer-events: none; }
-    .diagnostics { width: min(100%, 720px); display: grid; gap: 8px; }
-    .diagnostics h2 { margin: 4px 0; font-size: 1.1rem; }
-    .diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 5px 12px; }
-    .diagnostic-grid div { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid #333; padding: 4px; }
-    .diagnostic-grid dt { color: #aaa; }
-    .diagnostic-grid dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
-    .diagnostic-error { color: #ff9a9a; overflow-wrap: anywhere; }
-    .test-controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
-    .test-controls input { max-width: 100%; }
+    #cameraOverlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+    #cameraOverlay polygon { fill: none; stroke: #d3aa3c; stroke-width: 1.25; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+    #cameraOverlay[data-scan-state="detected"] polygon { stroke: #54c987; }
+    #cameraOverlay[data-scan-state="receiving"] polygon { stroke: #75aef5; }
+    #cameraBullseye { fill: none; stroke: #75e1c0; stroke-width: 1.5; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+    #cameraReadout { position: absolute; top: 10px; left: 10px; display: grid; gap: 2px; padding: 6px 8px; border: 1px solid rgb(255 255 255 / 14%); border-radius: 4px; background: rgb(0 0 0 / 48%); color: rgb(255 255 255 / 78%); font: 11px/1.35 ui-monospace, monospace; pointer-events: none; }
+    #receiveProgress { width: min(100%, 460px); height: 12px; accent-color: #43d17d; }
     #receivePreview img, #receivePreview video { max-width: min(100%, 480px); max-height: 55vh; }
     #scanCanvas { display: none; }
     [hidden] { display: none !important; }
@@ -41,77 +39,45 @@
 </head>
 <body>
   <main>
+    <h1>HCAC-OFT</h1>
     <nav class="tabs" aria-label="Transfer mode">
       <button id="sendTab" class="active" type="button" aria-selected="true">Send</button>
       <button id="receiveTab" type="button" aria-selected="false">Receive</button>
     </nav>
-    <div class="protocols" aria-label="Matrix size">
-      <label for="targetMatrixSize">Matrix size</label>
-      <select id="targetMatrixSize">
-        <option value="32" selected>32 x 32</option>
-      </select>
-      <span>custom scalable color fountain stream</span>
-    </div>
-
     <section id="sendPanel" class="panel" aria-labelledby="sendTab">
       <div class="controls">
         <input type="file" id="fileInput" aria-label="Choose file">
         <button id="sendButton" type="button" disabled>Send</button>
       </div>
       <div id="sendStatus" class="meta">Choose a file</div>
-      <div id="frameCount" class="meta"></div>
       <div id="sendFileName" class="meta"></div>
-      <div id="transmitTelemetry" class="meta telemetry">Frame — | FPS — | Idle | Canvas — | Matrix change —</div>
-      <canvas id="tx" aria-label="Current scalable color transfer frame"></canvas>
+      <div id="sendFileDetails" class="meta subtle" aria-live="polite"></div>
+      <canvas id="tx" aria-label="Current transfer image"></canvas>
     </section>
 
     <section id="receivePanel" class="panel" aria-labelledby="receiveTab" hidden>
       <div id="cameraPreview">
         <video id="camera" playsinline muted></video>
-        <canvas id="diagnosticOverlay" aria-hidden="true"></canvas>
-        <div id="previewStatus">WAITING — camera off</div>
+        <svg id="cameraOverlay" aria-hidden="true" preserveAspectRatio="xMidYMid meet">
+          <polygon id="cameraOutline" visibility="hidden"></polygon>
+          <polygon id="cameraBullseye" visibility="hidden"></polygon>
+        </svg>
+        <div id="cameraReadout" aria-hidden="true">
+          <span id="cameraReadoutState">SEARCHING</span>
+          <span id="cameraReadoutCounts">QR 0 · DATA 0/—</span>
+        </div>
       </div>
       <label for="zoomSlider">Camera zoom
         <input id="zoomSlider" type="range" min="1" max="1" step="0.1" value="1" disabled>
       </label>
       <button id="startButton" type="button">Start camera</button>
-      <div id="receiveStatus" class="meta">Ready - press Start camera; scans calibrated color packets</div>
-      <div id="zoomHelp" class="meta">Camera zoom support is checked when the camera starts.</div>
-      <div class="test-controls">
-        <button id="decoderTestButton" type="button">Run decoder self-test</button>
-        <label>Decode saved frame <input id="savedFrameInput" type="file" accept="image/*"></label>
-      </div>
-      <div id="decoderTestStatus" class="meta" aria-live="polite">Valid packets are saved in this browser and combined in any order; resume scanning the same transfer later if needed.</div>
-      <section class="diagnostics" aria-labelledby="diagnosticHeading">
-        <h2 id="diagnosticHeading">Receiver diagnostics</h2>
-        <dl class="diagnostic-grid">
-          <div><dt>Camera</dt><dd id="diagCamera">WAITING</dd></div>
-          <div><dt>Camera frames</dt><dd id="diagFrames">0 received</dd></div>
-          <div><dt>Image processing</dt><dd id="diagProcessing">0 processed</dd></div>
-          <div><dt>Candidate detection</dt><dd id="diagCandidates">0 candidates</dd></div>
-          <div><dt>Frame locator</dt><dd id="diagLocator">WAITING</dd></div>
-          <div><dt>Tracking state</dt><dd id="diagTracking">SEARCHING</dd></div>
-          <div><dt>Geometry</dt><dd id="diagGeometry">WAITING</dd></div>
-          <div><dt>Candidate confidence</dt><dd id="diagConfidence">Not measured</dd></div>
-          <div><dt>Bullseye location / size</dt><dd id="diagFinder">Not located</dd></div>
-          <div><dt>Orientation</dt><dd id="diagOrientation">WAITING</dd></div>
-          <div><dt>Grid sampling</dt><dd id="diagGrid">WAITING</dd></div>
-          <div><dt>Colour recognition</dt><dd id="diagColour">WAITING</dd></div>
-          <div><dt>Header validation</dt><dd id="diagHeader">WAITING</dd></div>
-          <div><dt>CRC validation</dt><dd id="diagCrc">WAITING</dd></div>
-          <div><dt>Packet decoding</dt><dd id="diagPackets">0 accepted</dd></div>
-          <div><dt>Reconstruction</dt><dd id="diagReconstruction">0 blocks</dd></div>
-          <div><dt>File verification</dt><dd id="diagVerification">WAITING</dd></div>
-          <div><dt>Last detection</dt><dd id="diagLastDetection">Never</dd></div>
-          <div><dt>Last packet ID</dt><dd id="diagLastPacket">—</dd></div>
-          <div><dt>Rejected candidates / packets</dt><dd id="diagRejected">0 / 0</dd></div>
-        </dl>
-        <div id="diagLatestError" class="diagnostic-error" role="status">Most recent error: none</div>
-      </section>
-      <div class="meta">Mobile Chrome requires HTTPS for camera access.</div>
-      <div id="receiveProgress" class="meta"></div>
+      <div id="receiveStatus" class="meta" role="status" aria-live="polite">Ready to scan. Point the camera at the sender and tap Start camera.</div>
+      <progress id="receiveProgress" max="1" value="0" aria-label="Recovered data blocks" hidden></progress>
+      <div id="receiveProgressText" class="meta" aria-live="polite">Waiting to detect a QR code.</div>
+      <div id="zoomHelp" class="meta"></div>
       <div id="receiveFileName" class="meta"></div>
       <div id="transferComplete" class="meta complete" hidden>Transfer Complete</div>
+      <button id="exportFileButton" type="button" hidden>Save or share file</button>
       <div id="receivePreview"></div>
     </section>
   </main>
