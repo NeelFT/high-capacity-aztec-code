@@ -1,7 +1,7 @@
 {
   "id": "./",
-  "name": "HCAC-OFT File Transfer",
-  "short_name": "HCAC-OFT",
+  "name": "High Capacity Aztec Code",
+  "short_name": "HCAC",
   "description": "Transfer files between screens using color-coded QR frames.",
   "start_url": "./",
   "scope": "./",

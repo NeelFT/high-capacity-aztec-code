@@ -1,4 +1,4 @@
-# High-Capacity Aztec Code
+# High Capacity Aztec Code
 
 A small experiment in moving a file from one screen to another with light. The app turns a file into a repeating stream of color-coded, Aztec-style frames. A second device watches that stream with its camera, rebuilds the file from the packets it can read, and downloads it when the transfer is complete.
 
@@ -57,4 +57,4 @@ npm run build
 npm run preview
 ```
 
-The production files are written to `dist/`.
+The root `index.html` is the app's single source entry point. The production build creates `dist/index.html` from it; `dist/` is generated output and is not committed. Production files are written to `dist/`.

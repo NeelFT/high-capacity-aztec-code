@@ -1,4 +1,4 @@
-const CACHE_NAME = 'hcac-oft-v1';
+const CACHE_NAME = 'hcac-oft-v2';
 const appRoot = new URL('./', self.registration.scope);
 const appIndex = appRoot.href;
 const coreAssets = [
